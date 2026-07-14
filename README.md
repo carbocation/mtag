@@ -1,10 +1,11 @@
 # MTAG on Python 3 (`feature/python3`)
 
-This branch of [github.com/carbocation/mtag](https://github.com/carbocation/mtag/tree/feature/python3)
+This branch of
+[github.com/carbocation/mtag](https://github.com/carbocation/mtag/tree/feature/python3)
 ports MTAG to Python 3.10 or newer while retaining the original command-line
 interface and intended numerical behavior. It also makes the optimized Polars
-loader, writer, and Sigma estimator the defaults and provides an optional
-fused Numba backend for high-dimensional maxFDR searches.
+loader, writer, and Sigma estimator the defaults and provides an optional fused
+Numba backend for high-dimensional maxFDR searches.
 
 ## Install this branch
 
@@ -36,11 +37,11 @@ python mtag.py \
   --out results/mtag
 ```
 
-The default loader expects genuinely tab-delimited input for its Polars path.
-Arbitrary-whitespace and bzip2 inputs automatically use the fused pandas
-loader. Use `--legacy-loader` for the complete historical pandas I/O and Sigma
-estimation path; `--load-backend pandas` and `--output-backend pandas` select
-only those individual compatibility paths.
+The default loader expects tab-delimited input for its Polars path.
+Arbitrary-whitespace and bzip2 inputs use the slower fused pandas loader. Use
+`--legacy-loader` for the complete historical pandas I/O and Sigma estimation
+path; `--load-backend pandas` and `--output-backend pandas` select only those
+individual compatibility paths.
 
 ## Run maxFDR separately
 
@@ -59,15 +60,13 @@ python mtag.py \
   --fdr-backend numba
 ```
 
-Every standard MTAG run writes `results/mtag_maxfdr_inputs.npz`, a tiny
-sidecar containing the exact trait-wise sample-size means required by default
-`--n_approx`. The separate maxFDR process uses it automatically, so it does
-not reread the large trait result tables. Outputs created before this sidecar
-was introduced remain supported. `--fit_ss` and `--no-n-approx` still read the
-necessary SNP-level columns because those modes cannot use only trait means.
-The archive contains scalar `format_version` and `n_snps` fields plus an
-`n_approx` vector in input-trait order; the existing Omega and Sigma text
-files remain the covariance source of truth.
+Every standard MTAG run now writes `results/mtag_maxfdr_inputs.npz`, which
+contains the trait-wise sample-size means required by default `--n_approx`. The
+separate maxFDR process uses it automatically, so it does not reread the large
+trait result tables. `--fit_ss` and `--no-n-approx` still read SNP-level data
+because those modes cannot use only trait means. The archive contains scalar
+`format_version` and `n_snps` fields plus an `n_approx` vector in input-trait
+order.
 
 The maxFDR estimate is written to `results/mtag_max_fdr.txt`. With the Numba
 backend, the default max-only calculation keeps memory bounded and does not
@@ -80,13 +79,23 @@ grid-order tie-breaking as exhaustive search. This approach makes the process
 more efficient and does not require any approximations so does not change the
 output.
 
-`--fdr-search exhaustive` selects the bounded exhaustive Numba implementation
-as a compatibility reference. In automatic mode, a branch-search memory guard
-falls back to that implementation rather than risking an oversized temporary
-table. Add `--fdr-write-full-grid` if you also need the historical
-probability-grid and FDR-matrix files; full-grid output necessarily uses the
-exhaustive search. Custom `--grid_file` inputs currently use
-`--fdr-backend python`.
+Branch tables store only occupied causal states. At `--intervals 10`, every grid
+point contains ten probability units and can therefore occupy at most ten
+states, even though there are theoretically `2^T` states.
+
+`--fdr-search exhaustive` selects the bounded exhaustive Numba implementation as
+a compatibility reference. A branch-search memory guard falls back to that
+implementation only for reasonably sized grids. Add `--fdr-write-full-grid` if
+you also need the historical probability-grid and FDR-matrix files; full-grid
+output necessarily uses the exhaustive search. Custom `--grid_file` inputs
+currently use `--fdr-backend python`.
+
+### Grid resolution and interpretation
+
+`--intervals` controls the probability lattice: e.g., '10' searches
+probabilities in increments of 0.1; '20' uses increments of 0.05; etc. When the
+finer interval count is a multiple of the coarser one, the finer grid contains
+every coarser point, so its maximum cannot be lower.
 
 ---
 

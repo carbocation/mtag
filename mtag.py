@@ -2501,7 +2501,7 @@ def _FDR_par(func_args):
     return _compute_fdr_values(probs, omega_hat, S, prepared), g
 
 
-def _run_numba_fdr_grid(args, causal_states, prepared, pi_causal_ss):
+def _run_numba_fdr_grid(args, num_traits, prepared, pi_causal_ss):
     """Run the optional fused Numba automatic-grid maxFDR engine."""
     try:
         import numba
@@ -2522,8 +2522,9 @@ def _run_numba_fdr_grid(args, causal_states, prepared, pi_causal_ss):
             )
         )
     numba.set_num_threads(thread_count)
-    total_points = mtag_numba.automatic_grid_size(
-        len(causal_states), args.intervals
+    num_states = 1 << num_traits
+    total_points = mtag_numba.nominal_grid_size(
+        num_states, args.intervals
     )
     write_full_grid = getattr(args, 'fdr_write_full_grid', False)
     requested_search = getattr(args, 'fdr_search', 'auto')
@@ -2536,7 +2537,7 @@ def _run_numba_fdr_grid(args, causal_states, prepared, pi_causal_ss):
     if search_method == 'auto':
         search_method = (
             'branch'
-            if not write_full_grid and causal_states.shape[1] >= 5
+            if not write_full_grid and num_traits >= 5
             else 'exhaustive'
         )
 
@@ -2549,14 +2550,18 @@ def _run_numba_fdr_grid(args, causal_states, prepared, pi_causal_ss):
         try:
             branch_result = mtag_numba.evaluate_automatic_grid_max_branch(
                 args.intervals,
-                causal_states,
+                num_traits,
                 args.omega_hat,
                 prepared,
                 pi_causal_ss=pi_causal_ss,
             )
         except mtag_numba.BranchSearchLimitExceeded as error:
-            if requested_search == 'branch':
-                raise ValueError(str(error)) from error
+            if requested_search == 'branch' or total_points > 100_000_000:
+                raise ValueError(
+                    '{}. Automatic exhaustive fallback is disabled for the '
+                    '{:,}-point grid; use --fdr-search exhaustive explicitly '
+                    'if that cost is intentional.'.format(error, total_points)
+                ) from error
             logging.info(
                 'Branch-and-prune guard reached ({}); falling back to the '
                 'bounded exhaustive Numba search.'.format(error)
@@ -2573,22 +2578,33 @@ def _run_numba_fdr_grid(args, causal_states, prepared, pi_causal_ss):
                 )
             )
             logging.info(
-                'Branch seed: {:,} candidates for each of {:,} tested '
-                'trait subsets; {:,} partial tables retained.'.format(
+                'Branch seed: {:,} candidates for each subset; {:,} of '
+                '{:,} bounded candidates completed ({:,} short-circuited '
+                'after losing to the best seed, {:,} skipped by the memory '
+                'guard, {:,} subsets possible); {:,} sparse partial tables '
+                'retained.'.format(
                     diagnostics['seed_candidates_per_subset'],
                     diagnostics['seed_subsets_tested'],
+                    diagnostics['seed_subsets_considered'],
+                    diagnostics['seed_subsets_short_circuited'],
+                    diagnostics['seed_subsets_skipped'],
+                    diagnostics['seed_subsets_available'],
                     diagnostics['seed_retained'],
                 )
             )
             for level in diagnostics['levels']:
                 logging.info(
                     'Branch extension adding Trait {}: {:,} candidates per '
-                    'ordering choice across {:,} choices; {:,} partial '
-                    'tables retained.'.format(
+                    'ordering choice across {:,} choices; {:,} sparse '
+                    'partial tables retained (bordered PSD: {:,} accepted, '
+                    '{:,} rejected, {:,} eigen fallbacks).'.format(
                         level['trait'] + 1,
                         level['candidates_per_choice'],
                         level['choices_tested'],
                         level['retained'],
+                        level['fast_psd_accepts'],
+                        level['fast_psd_rejects'],
+                        level['eigen_fallbacks'],
                     )
                 )
             logging.info(
@@ -2636,6 +2652,7 @@ def _run_numba_fdr_grid(args, causal_states, prepared, pi_causal_ss):
             if write_full_grid
             else 1000000
         )
+    causal_states = create_S(num_traits)
     return evaluation_function(
         args.intervals,
         causal_states,
@@ -2674,9 +2691,13 @@ def _save_and_log_max_fdr(args, max_fdr, maximizing_probabilities):
         logging.info('Maximum FDR')
         message = 'Max FDR of Trait {}: {} at probs = {}'
     for trait, value in enumerate(max_fdr):
+        if hasattr(maximizing_probabilities, 'format_row'):
+            maximizing_point = maximizing_probabilities.format_row(trait)
+        else:
+            maximizing_point = maximizing_probabilities[trait]
         logging.info(
             message.format(
-                trait + 1, value, maximizing_probabilities[trait]
+                trait + 1, value, maximizing_point
             )
         )
     logging.info(borderline)
@@ -2725,8 +2746,6 @@ def fdr(args, Ns_f, Zs, n_approx_precomputed=False):
     if not np.allclose(args.sigma_hat, args.sigma_hat.T):
         raise ValueError('maxFDR residual covariance matrix must be symmetric')
     logging.info('T='+str(T))
-    S = create_S(T)
-    causal_prob = lambda x, SS: np.sum(np.einsum('s,st->st',x,SS),axis=0)
 
     pi_causal_ss = None
     if args.fit_ss:
@@ -2772,7 +2791,7 @@ def fdr(args, Ns_f, Zs, n_approx_precomputed=False):
                 'only; omit --grid_file or use --fdr_backend python'
             )
         numba_result = _run_numba_fdr_grid(
-            args, S, prepared, pi_causal_ss
+            args, T, prepared, pi_causal_ss
         )
         if getattr(args, 'fdr_write_full_grid', False):
             prob_grid, FDR = numba_result
@@ -2810,6 +2829,10 @@ def fdr(args, Ns_f, Zs, n_approx_precomputed=False):
             raise ValueError(
                 '--fdr-search applies only with --fdr-backend numba'
             )
+        S = create_S(T)
+        causal_prob = lambda x, SS: np.sum(
+            np.einsum('s,st->st', x, SS), axis=0
+        )
         if args.grid_file is not None:
             candidate_grid = load_probability_grid(args.grid_file, len(S))
         else:

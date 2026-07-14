@@ -238,8 +238,26 @@ def test_count_comparison_matches_historical_grid_order(
             rank, intervals, num_states, combinations, counts
         )
         if previous is not None:
-            assert mtag_numba._count_vector_precedes(previous, counts)
-            assert not mtag_numba._count_vector_precedes(counts, previous)
+            previous_ids = np.flatnonzero(previous).astype(np.uint64)
+            current_ids = np.flatnonzero(counts).astype(np.uint64)
+            previous_counts = previous[previous_ids.astype(int)]
+            current_counts = counts[current_ids.astype(int)]
+            assert mtag_numba._sparse_count_vector_precedes(
+                previous_ids,
+                previous_counts,
+                len(previous_ids),
+                current_ids,
+                current_counts,
+                len(current_ids),
+            )
+            assert not mtag_numba._sparse_count_vector_precedes(
+                current_ids,
+                current_counts,
+                len(current_ids),
+                previous_ids,
+                previous_counts,
+                len(previous_ids),
+            )
         previous = counts.copy()
 
 
@@ -319,7 +337,7 @@ def test_sparse_max_matches_dense_numba_grid_for_four_traits():
     )
 
 
-@pytest.mark.parametrize("traits,intervals,seed", [(4, 2, 314), (5, 2, 159)])
+@pytest.mark.parametrize("traits,intervals,seed", [(4, 3, 314), (5, 3, 159)])
 def test_exact_branch_search_matches_exhaustive_numba(
     traits, intervals, seed
 ):
@@ -356,11 +374,47 @@ def test_exact_branch_search_matches_exhaustive_numba(
     assert diagnostics["exhaustive_candidates"] == (
         mtag_numba.automatic_grid_size(len(causal_states), intervals)
     )
+    assert diagnostics["representation"] == "sparse"
     assert actual_count == expected_count
     np.testing.assert_array_equal(actual_max, expected_max)
     np.testing.assert_array_equal(
         actual_probabilities, expected_probabilities
     )
+
+
+def test_sparse_branch_spike_slab_restriction_matches_exhaustive():
+    traits = 5
+    intervals = 3
+    rng = np.random.default_rng(2718)
+    raw_omega = rng.normal(size=(traits, traits))
+    omega = raw_omega @ raw_omega.T + np.eye(traits)
+    omega *= 2.0e-5 / np.mean(np.diag(omega))
+    sigma = np.eye(traits)
+    sample_sizes = np.full((1, traits), 100_000.0)
+    prepared = mtag._prepare_fdr_calculation(
+        omega, sigma, sample_sizes, np.ones(1), 5.0e-8
+    )
+    pi_causal = np.full(traits, 0.5)
+
+    expected = mtag_numba.evaluate_automatic_grid_max(
+        intervals,
+        mtag.create_S(traits),
+        omega,
+        prepared,
+        pi_causal_ss=pi_causal,
+        chunk_size=1000,
+    )
+    actual = mtag_numba.evaluate_automatic_grid_max_branch(
+        intervals,
+        traits,
+        omega,
+        prepared,
+        pi_causal_ss=pi_causal,
+    )
+
+    assert actual[2] == expected[2]
+    np.testing.assert_array_equal(actual[0], expected[0])
+    np.testing.assert_array_equal(actual[1], expected[1])
 
 
 def test_real_five_trait_branch_regression_matches_historical_run():
@@ -481,8 +535,214 @@ def test_real_five_trait_branch_regression_matches_historical_run():
     assert diagnostics["exhaustive_candidates"] == 1_121_099_408
     assert diagnostics["final_pruned_leaves"] == 48
     assert diagnostics["trait_order"] != list(range(5))
+    assert all(
+        level["fast_psd_accepts"] + level["fast_psd_rejects"] > 0
+        for level in diagnostics["levels"]
+    )
     np.testing.assert_array_equal(max_fdr, expected_max)
     np.testing.assert_array_equal(probabilities, expected_probabilities)
+
+    refined_max, _, refined_count, refined_diagnostics = (
+        mtag_numba.evaluate_automatic_grid_max_branch(
+            20, 5, omega, prepared
+        )
+    )
+    expected_refined_max = np.array(
+        [
+            0.0028095775895184047,
+            0.003013923520981947,
+            0.0017800904937819437,
+            0.00394098847348618,
+            0.0019085208967734293,
+        ]
+    )
+    assert refined_count == 437
+    assert refined_diagnostics["exhaustive_candidates"] == 77_535_155_627_160
+    assert refined_diagnostics["final_pruned_leaves"] == 437
+    np.testing.assert_array_equal(refined_max, expected_refined_max)
+    assert np.all(refined_max >= max_fdr)
+
+    omega_six = np.zeros((6, 6))
+    omega_six[:5, :5] = omega
+    omega_six[5, 5] = np.mean(np.diag(omega))
+    sigma_six = np.zeros((6, 6))
+    sigma_six[:5, :5] = sigma
+    sigma_six[5, 5] = 1.0
+    sample_sizes_six = np.c_[sample_sizes, 100_000.0]
+    prepared_six = mtag._prepare_fdr_calculation(
+        omega_six,
+        sigma_six,
+        sample_sizes_six,
+        np.ones(1),
+        5.0e-8,
+    )
+    six_max, _, six_count, six_diagnostics = (
+        mtag_numba.evaluate_automatic_grid_max_branch(
+            10, 6, omega_six, prepared_six
+        )
+    )
+    assert np.all(np.isfinite(six_max))
+    assert six_count == 1_966
+    assert six_diagnostics["exhaustive_candidates"] == 621_324_937_376
+    assert six_diagnostics["final_pruned_leaves"] == 1_966
+
+
+def test_branch_path_does_not_materialize_all_binary_states(
+    tmp_path, monkeypatch
+):
+    traits = 5
+    omega = np.eye(traits) * 1.0e-5
+    sigma = np.eye(traits)
+    sample_sizes = np.full((1, traits), 100_000.0)
+
+    def unexpected_dense_states(_):
+        raise AssertionError("dense causal state table was materialized")
+
+    monkeypatch.setattr(mtag, "create_S", unexpected_dense_states)
+    max_fdr, probabilities = mtag.fdr(
+        _args(
+            tmp_path / "sparse-branch",
+            "numba",
+            fdr_search="branch",
+            intervals=2,
+            omega_hat=omega,
+            sigma_hat=sigma,
+        ),
+        sample_sizes,
+        np.zeros_like(sample_sizes),
+    )
+
+    assert np.all(np.isfinite(max_fdr))
+    assert probabilities.shape == (traits, 1 << traits)
+
+
+def test_large_auto_grid_does_not_silently_fall_back_to_exhaustive(
+    tmp_path, monkeypatch
+):
+    traits = 5
+
+    def guarded_branch(*args, **kwargs):
+        raise mtag_numba.BranchSearchLimitExceeded("test guard")
+
+    monkeypatch.setattr(
+        mtag_numba,
+        "evaluate_automatic_grid_max_branch",
+        guarded_branch,
+    )
+    with pytest.raises(ValueError, match="fallback is disabled"):
+        mtag.fdr(
+            _args(
+                tmp_path / "guarded-auto",
+                "numba",
+                intervals=10,
+                omega_hat=np.eye(traits) * 1.0e-5,
+                sigma_hat=np.eye(traits),
+            ),
+            np.full((1, traits), 100_000.0),
+            np.zeros((1, traits)),
+        )
+
+
+def test_trait_order_trials_and_sparse_memory_are_bounded():
+    traits = 20
+    omega = np.eye(traits)
+    omega += 0.05 * (np.ones((traits, traits)) - np.eye(traits))
+
+    seed_orders = mtag_numba.candidate_seed_orders(
+        omega, trial_limit=12
+    )
+    extension_traits = mtag_numba.candidate_extension_traits(
+        omega,
+        order=[0, 1, 2],
+        remaining=list(range(3, traits)),
+        trial_limit=7,
+    )
+
+    assert len(seed_orders) <= 12
+    assert len(set(seed_orders)) == len(seed_orders)
+    assert all(len(set(order)) == 3 for order in seed_orders)
+    assert len(extension_traits) == 7
+    assert mtag_numba._sparse_table_bytes_per_row(10, traits) < 6_000
+    assert (1 << traits) * 8 > 8_000_000
+
+
+def test_sparse_maximizing_probability_rows_materialize_on_demand():
+    state_ids = np.array([[3, 7, 0], [1, 6, 0]], dtype=np.uint64)
+    counts = np.array([[4, 6, 0], [2, 8, 0]], dtype=np.int64)
+    occupied = np.array([2, 2], dtype=np.int64)
+    probabilities = mtag_numba._materialize_sparse_probability_rows(
+        state_ids,
+        counts,
+        occupied,
+        intervals=10,
+        num_states=8,
+        byte_limit=1,
+    )
+
+    assert isinstance(probabilities, mtag_numba.SparseProbabilityRows)
+    assert probabilities.shape == (2, 8)
+    expected = np.zeros((2, 8))
+    expected[0, [3, 7]] = [0.4, 0.6]
+    expected[1, [1, 6]] = [0.2, 0.8]
+    np.testing.assert_array_equal(np.asarray(probabilities), expected)
+    assert "3" in probabilities.format_row(0)
+
+
+def test_large_nominal_grid_size_does_not_require_int64_rank():
+    total = mtag_numba.nominal_grid_size(1 << 9, 10)
+    assert total > np.iinfo(np.int64).max
+    with pytest.raises(OverflowError):
+        mtag_numba.automatic_grid_size(1 << 9, 10)
+
+
+def test_bordered_psd_reuse_has_conservative_boundary_fallbacks():
+    intervals = 10
+    tolerance = 1.0e-12
+    pair_counts = np.full(6, intervals, dtype=np.int64)
+    parent_factor = np.eye(2)
+    child_factor = np.empty((3, 3))
+
+    positive = np.eye(3)
+    valid, factor_valid, status = (
+        mtag_numba._bordered_principal_psd_check(
+            parent_factor,
+            True,
+            pair_counts,
+            intervals,
+            positive,
+            tolerance,
+            child_factor,
+        )
+    )
+    assert valid and factor_valid and status == 1
+
+    near_boundary = np.diag([1.0, 1.0, -0.5 * tolerance])
+    valid, factor_valid, status = (
+        mtag_numba._bordered_principal_psd_check(
+            parent_factor,
+            True,
+            pair_counts,
+            intervals,
+            near_boundary,
+            tolerance,
+            child_factor,
+        )
+    )
+    assert valid and not factor_valid and status == 0
+
+    clearly_indefinite = np.diag([1.0, 1.0, -32.0 * tolerance])
+    valid, factor_valid, status = (
+        mtag_numba._bordered_principal_psd_check(
+            parent_factor,
+            True,
+            pair_counts,
+            intervals,
+            clearly_indefinite,
+            tolerance,
+            child_factor,
+        )
+    )
+    assert not valid and not factor_valid and status == -1
 
 
 def test_branch_search_memory_guard_is_explicit():
