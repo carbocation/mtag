@@ -21,6 +21,7 @@ def _args(output_prefix, backend, **overrides):
         "cores": 1,
         "fdr_backend": backend,
         "fdr_chunk_size": 3,
+        "fdr_search": "auto",
         "fdr_write_full_grid": False,
         "fit_ss": False,
         "grid_file": None,
@@ -153,6 +154,33 @@ def test_numba_full_grid_output_remains_available(tmp_path):
     assert (tmp_path / "numba-full_max_fdr.txt").exists()
 
 
+def test_branch_search_rejects_full_grid_output(tmp_path):
+    with pytest.raises(ValueError, match="max-only output"):
+        mtag.fdr(
+            _args(
+                tmp_path / "branch-full",
+                "numba",
+                fdr_search="branch",
+                fdr_write_full_grid=True,
+            ),
+            np.array([[10_000.0, 12_000.0]]),
+            np.zeros((1, 2)),
+        )
+
+
+def test_python_backend_rejects_numba_search_selection(tmp_path):
+    with pytest.raises(ValueError, match="applies only"):
+        mtag.fdr(
+            _args(
+                tmp_path / "python-branch",
+                "python",
+                fdr_search="branch",
+            ),
+            np.array([[10_000.0, 12_000.0]]),
+            np.zeros((1, 2)),
+        )
+
+
 def test_numba_backend_rejects_custom_probability_grid(tmp_path):
     grid_path = tmp_path / "grid.txt"
     np.savetxt(grid_path, [[0.0, 0.5, 0.0, 0.5]])
@@ -191,6 +219,28 @@ def test_six_trait_ten_interval_grid_supports_int64_ranks():
     np.testing.assert_array_equal(
         counts, np.r_[intervals, np.zeros(num_states - 1, dtype=int)]
     )
+
+
+@pytest.mark.parametrize("num_states,intervals", [(2, 3), (4, 3), (8, 2)])
+def test_count_comparison_matches_historical_grid_order(
+    num_states, intervals
+):
+    total_points = mtag_numba.automatic_grid_size(num_states, intervals)
+    combinations = mtag_numba.binomial_table(
+        intervals + num_states - 1,
+        max(num_states - 1, intervals),
+    )
+    counts = np.empty(num_states, dtype=np.int64)
+    previous = None
+
+    for rank in range(total_points):
+        mtag_numba._unrank_composition(
+            rank, intervals, num_states, combinations, counts
+        )
+        if previous is not None:
+            assert mtag_numba._count_vector_precedes(previous, counts)
+            assert not mtag_numba._count_vector_precedes(counts, previous)
+        previous = counts.copy()
 
 
 @pytest.mark.parametrize("num_states,intervals", [(4, 3), (8, 2)])
@@ -267,6 +317,192 @@ def test_sparse_max_matches_dense_numba_grid_for_four_traits():
     np.testing.assert_array_equal(
         actual_probabilities, dense_grid[expected_indices]
     )
+
+
+@pytest.mark.parametrize("traits,intervals,seed", [(4, 2, 314), (5, 2, 159)])
+def test_exact_branch_search_matches_exhaustive_numba(
+    traits, intervals, seed
+):
+    causal_states = mtag.create_S(traits)
+    rng = np.random.default_rng(seed)
+    raw_omega = rng.normal(size=(traits, traits))
+    omega = raw_omega @ raw_omega.T
+    omega *= 2.0e-5 / np.mean(np.diag(omega))
+    omega += np.eye(traits) * 1.0e-5
+    sigma = np.full((traits, traits), 0.05)
+    np.fill_diagonal(sigma, 1.0)
+    sample_sizes = np.array(
+        [np.linspace(80_000.0, 130_000.0, traits)]
+    )
+    prepared = mtag._prepare_fdr_calculation(
+        omega, sigma, sample_sizes, np.ones(1), 5.0e-8
+    )
+
+    expected_max, expected_probabilities, expected_count = (
+        mtag_numba.evaluate_automatic_grid_max(
+            intervals,
+            causal_states,
+            omega,
+            prepared,
+            chunk_size=17,
+        )
+    )
+    actual_max, actual_probabilities, actual_count, diagnostics = (
+        mtag_numba.evaluate_automatic_grid_max_branch(
+            intervals, causal_states, omega, prepared
+        )
+    )
+
+    assert diagnostics["exhaustive_candidates"] == (
+        mtag_numba.automatic_grid_size(len(causal_states), intervals)
+    )
+    assert actual_count == expected_count
+    np.testing.assert_array_equal(actual_max, expected_max)
+    np.testing.assert_array_equal(
+        actual_probabilities, expected_probabilities
+    )
+
+
+def test_real_five_trait_branch_regression_matches_historical_run():
+    omega = np.array(
+        [
+            [
+                3.875220595894177e-06,
+                1.5020955496521807e-06,
+                -2.494193026680934e-06,
+                1.0109516024171428e-07,
+                1.5842123683951421e-06,
+            ],
+            [
+                1.5020955496521807e-06,
+                4.020099400582166e-06,
+                -1.2586329813655462e-06,
+                4.932638357576401e-07,
+                1.3957082703225266e-06,
+            ],
+            [
+                -2.494193026680934e-06,
+                -1.2586329813655462e-06,
+                4.26107618042203e-06,
+                -1.8029895784903273e-07,
+                -1.949985504003797e-06,
+            ],
+            [
+                1.0109516024171428e-07,
+                4.932638357576401e-07,
+                -1.8029895784903273e-07,
+                1.084780947488981e-06,
+                1.2027420559655031e-06,
+            ],
+            [
+                1.5842123683951421e-06,
+                1.3957082703225266e-06,
+                -1.949985504003797e-06,
+                1.2027420559655031e-06,
+                2.167377501054478e-06,
+            ],
+        ]
+    )
+    sigma = np.array(
+        [
+            [
+                1.0056843864584488,
+                0.3573467020556312,
+                -0.6191929149077187,
+                0.0085777296016904,
+                -0.003160735055182767,
+            ],
+            [
+                0.3573467020556312,
+                1.0249187640689477,
+                -0.24200411068335428,
+                0.007531040089317779,
+                -8.288716959050474e-06,
+            ],
+            [
+                -0.6191929149077187,
+                -0.24200411068335428,
+                0.9960809804692066,
+                -0.012647249724174673,
+                -0.012601533252360603,
+            ],
+            [
+                0.0085777296016904,
+                0.007531040089317779,
+                -0.012647249724174673,
+                0.9776546122748961,
+                0.10790627935366807,
+            ],
+            [
+                -0.003160735055182767,
+                -8.288716959050474e-06,
+                -0.012601533252360603,
+                0.10790627935366807,
+                1.0146291642511813,
+            ],
+        ]
+    )
+    sample_sizes = np.array(
+        [
+            [
+                78_581.0,
+                78_581.0,
+                78_581.0,
+                218_704.4102766652,
+                48_437.15624649526,
+            ]
+        ]
+    )
+    prepared = mtag._prepare_fdr_calculation(
+        omega, sigma, sample_sizes, np.ones(1), 5.0e-8
+    )
+
+    max_fdr, probabilities, feasible_count, diagnostics = (
+        mtag_numba.evaluate_automatic_grid_max_branch(
+            10, mtag.create_S(5), omega, prepared
+        )
+    )
+    expected_max = np.array(
+        [
+            0.0027121832941844446,
+            0.003013923520981947,
+            0.00177892174753345,
+            0.00394098847348618,
+            0.0019085208967734293,
+        ]
+    )
+    expected_probabilities = np.zeros((5, 32))
+    expected_probabilities[:, 8] = 0.3
+    expected_probabilities[:, 31] = 0.7
+    expected_probabilities[1, 8] = 0.0
+    expected_probabilities[1, 23] = 0.3
+
+    assert feasible_count == 48
+    assert diagnostics["exhaustive_candidates"] == 1_121_099_408
+    assert diagnostics["final_pruned_leaves"] == 48
+    assert diagnostics["trait_order"] != list(range(5))
+    np.testing.assert_array_equal(max_fdr, expected_max)
+    np.testing.assert_array_equal(probabilities, expected_probabilities)
+
+
+def test_branch_search_memory_guard_is_explicit():
+    traits = 4
+    causal_states = mtag.create_S(traits)
+    omega = np.eye(traits) * 1.0e-5
+    sigma = np.eye(traits)
+    sample_sizes = np.full((1, traits), 100_000.0)
+    prepared = mtag._prepare_fdr_calculation(
+        omega, sigma, sample_sizes, np.ones(1), 5.0e-8
+    )
+
+    with pytest.raises(mtag_numba.BranchSearchLimitExceeded):
+        mtag_numba.evaluate_automatic_grid_max_branch(
+            2,
+            causal_states,
+            omega,
+            prepared,
+            candidate_limit=1,
+        )
 
 
 def test_six_trait_sparse_rank_ranges_match_dense_kernel():
@@ -381,9 +617,12 @@ def test_numba_backend_cli_options_parse():
             "numba",
             "--fdr-chunk-size",
             "4096",
+            "--fdr-search",
+            "branch",
             "--fdr-write-full-grid",
         ]
     )
     assert parsed.fdr_backend == "numba"
     assert parsed.fdr_chunk_size == 4096
+    assert parsed.fdr_search == "branch"
     assert parsed.fdr_write_full_grid

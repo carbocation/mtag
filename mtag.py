@@ -2525,6 +2525,80 @@ def _run_numba_fdr_grid(args, causal_states, prepared, pi_causal_ss):
     total_points = mtag_numba.automatic_grid_size(
         len(causal_states), args.intervals
     )
+    write_full_grid = getattr(args, 'fdr_write_full_grid', False)
+    requested_search = getattr(args, 'fdr_search', 'auto')
+    if requested_search == 'branch' and write_full_grid:
+        raise ValueError(
+            '--fdr-search branch currently supports max-only output; omit '
+            '--fdr-write-full-grid or use --fdr-search exhaustive'
+        )
+    search_method = requested_search
+    if search_method == 'auto':
+        search_method = (
+            'branch'
+            if not write_full_grid and causal_states.shape[1] >= 5
+            else 'exhaustive'
+        )
+
+    if search_method == 'branch':
+        logging.info(
+            'Exact branch-and-prune maxFDR search will use principal '
+            'covariance constraints instead of exhaustively visiting all '
+            '{:,} candidate grid points.'.format(total_points)
+        )
+        try:
+            branch_result = mtag_numba.evaluate_automatic_grid_max_branch(
+                args.intervals,
+                causal_states,
+                args.omega_hat,
+                prepared,
+                pi_causal_ss=pi_causal_ss,
+            )
+        except mtag_numba.BranchSearchLimitExceeded as error:
+            if requested_search == 'branch':
+                raise ValueError(str(error)) from error
+            logging.info(
+                'Branch-and-prune guard reached ({}); falling back to the '
+                'bounded exhaustive Numba search.'.format(error)
+            )
+            search_method = 'exhaustive'
+        else:
+            max_fdr, maximizing_probabilities, feasible_count, diagnostics = (
+                branch_result
+            )
+            logging.info(
+                'Branch search selected trait order {} (original 1-based '
+                'indices).'.format(
+                    [trait + 1 for trait in diagnostics['trait_order']]
+                )
+            )
+            logging.info(
+                'Branch seed: {:,} candidates for each of {:,} tested '
+                'trait subsets; {:,} partial tables retained.'.format(
+                    diagnostics['seed_candidates_per_subset'],
+                    diagnostics['seed_subsets_tested'],
+                    diagnostics['seed_retained'],
+                )
+            )
+            for level in diagnostics['levels']:
+                logging.info(
+                    'Branch extension adding Trait {}: {:,} candidates per '
+                    'ordering choice across {:,} choices; {:,} partial '
+                    'tables retained.'.format(
+                        level['trait'] + 1,
+                        level['candidates_per_choice'],
+                        level['choices_tested'],
+                        level['retained'],
+                    )
+                )
+            logging.info(
+                'Branch search evaluated {:,} complete pruned leaves; {:,} '
+                'grid points passed the exact historical constraints.'.format(
+                    diagnostics['final_pruned_leaves'], feasible_count
+                )
+            )
+            return max_fdr, maximizing_probabilities, feasible_count
+
     logging.info(
         'Fused Numba maxFDR engine will generate and evaluate {:,} candidate '
         'grid points using {} threads, {}.'.format(
@@ -2532,7 +2606,7 @@ def _run_numba_fdr_grid(args, causal_states, prepared, pi_causal_ss):
             thread_count,
             (
                 'retaining the full feasible grid'
-                if getattr(args, 'fdr_write_full_grid', False)
+                if write_full_grid
                 else 'retaining only each trait\'s maximum'
             ),
         )
@@ -2552,14 +2626,14 @@ def _run_numba_fdr_grid(args, causal_states, prepared, pi_causal_ss):
 
     evaluation_function = (
         mtag_numba.evaluate_automatic_grid
-        if getattr(args, 'fdr_write_full_grid', False)
+        if write_full_grid
         else mtag_numba.evaluate_automatic_grid_max
     )
     chunk_size = getattr(args, 'fdr_chunk_size', None)
     if chunk_size is None:
         chunk_size = (
             100000
-            if getattr(args, 'fdr_write_full_grid', False)
+            if write_full_grid
             else 1000000
         )
     return evaluation_function(
@@ -2732,6 +2806,10 @@ def fdr(args, Ns_f, Zs, n_approx_precomputed=False):
             )
             return max_FDR, maximizing_probabilities
     else:
+        if getattr(args, 'fdr_search', 'auto') != 'auto':
+            raise ValueError(
+                '--fdr-search applies only with --fdr-backend numba'
+            )
         if args.grid_file is not None:
             candidate_grid = load_probability_grid(args.grid_file, len(S))
         else:
@@ -3061,6 +3139,7 @@ fdr_opts.add_argument('--p_sig', default=5.0e-8, type=float, action='store', hel
 fdr_opts.add_argument('--n_approx', default=True, dest='n_approx', action='store_true', help='Speed up FDR calculation by replacing the sample size of a SNP for each trait by the mean across SNPs (for each trait). Recommended and enabled by default.')
 fdr_opts.add_argument('--no_n_approx', '--no-n-approx', dest='n_approx', action='store_false', help='Use each distinct row of SNP sample sizes in the maxFDR power calculation instead of trait means.')
 fdr_opts.add_argument('--fdr_backend', '--fdr-backend', choices=('python', 'numba'), default='python', help='maxFDR execution engine. The optional numba backend fuses automatic-grid generation and evaluation; install requirements-numba.txt first. Default is python.')
+fdr_opts.add_argument('--fdr_search', '--fdr-search', choices=('auto', 'branch', 'exhaustive'), default='auto', help='Automatic-grid search strategy for the Numba backend. Auto uses exact branch-and-prune for five or more traits with max-only output and bounded exhaustive streaming otherwise. Use exhaustive as a compatibility reference.')
 fdr_opts.add_argument('--fdr_chunk_size', '--fdr-chunk-size', default=None, type=int, help='Number of automatic maxFDR candidates evaluated per native chunk with --fdr_backend numba. Defaults to 1000000 for max-only reduction and 100000 with --fdr-write-full-grid.')
 fdr_opts.add_argument('--fdr_write_full_grid', '--fdr-write-full-grid', action='store_true', help='With --fdr_backend numba, retain and write the complete feasible probability grid and FDR matrix instead of only the per-trait maxima.')
 

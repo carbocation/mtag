@@ -1,9 +1,14 @@
 """Optional Numba kernels for fused automatic maxFDR grid evaluation."""
 
+import itertools
 import math
 
 import numpy as np
 from numba import njit, prange
+
+
+class BranchSearchLimitExceeded(RuntimeError):
+    """Raised when exact branch traversal would exceed its memory guard."""
 
 
 def automatic_grid_size(num_states, intervals):
@@ -403,8 +408,10 @@ def _evaluate_automatic_grid_chunk(
 
 
 @njit(inline="always")
-def _evaluate_sparse_candidate(
-    star_positions,
+def _evaluate_occupied_candidate(
+    state_ids,
+    multiplicities,
+    num_occupied,
     intervals,
     causal_states,
     state_trait_ids,
@@ -424,24 +431,12 @@ def _evaluate_sparse_candidate(
     pi_causal_ss,
     candidate_fdr,
 ):
-    """Evaluate one sparse composition and store its per-trait FDR."""
+    """Evaluate one occupied-state representation and store its FDR."""
     _, num_traits = causal_states.shape
     num_pairs = num_traits * (num_traits + 1) // 2
     num_n_values = n_counts.shape[0]
     sqrt_two = math.sqrt(2.0)
     eps = np.finfo(np.float64).eps
-
-    state_ids = np.empty(intervals, dtype=np.int64)
-    multiplicities = np.empty(intervals, dtype=np.int64)
-    num_occupied = 0
-    for star_index in range(intervals):
-        state = star_positions[star_index] - star_index
-        if num_occupied and state_ids[num_occupied - 1] == state:
-            multiplicities[num_occupied - 1] += 1
-        else:
-            state_ids[num_occupied] = state
-            multiplicities[num_occupied] = 1
-            num_occupied += 1
 
     pair_counts = np.zeros(num_pairs, dtype=np.int64)
     for occupied_index in range(num_occupied):
@@ -531,6 +526,124 @@ def _evaluate_sparse_candidate(
                 false_discovery_power += state_power
         candidate_fdr[trait] = false_discovery_power / total_power
     return True
+
+
+@njit(inline="always")
+def _evaluate_sparse_candidate(
+    star_positions,
+    intervals,
+    causal_states,
+    state_trait_ids,
+    state_trait_counts,
+    state_pair_indices,
+    state_pair_counts,
+    pair_index,
+    omega,
+    num_left,
+    num_right,
+    denominator,
+    sigma_numerator,
+    n_counts,
+    n_total,
+    z_threshold,
+    fit_ss,
+    pi_causal_ss,
+    candidate_fdr,
+):
+    """Evaluate one sparse composition and store its per-trait FDR."""
+    state_ids = np.empty(intervals, dtype=np.int64)
+    multiplicities = np.empty(intervals, dtype=np.int64)
+    num_occupied = 0
+    for star_index in range(intervals):
+        state = star_positions[star_index] - star_index
+        if num_occupied and state_ids[num_occupied - 1] == state:
+            multiplicities[num_occupied - 1] += 1
+        else:
+            state_ids[num_occupied] = state
+            multiplicities[num_occupied] = 1
+            num_occupied += 1
+
+    return _evaluate_occupied_candidate(
+        state_ids,
+        multiplicities,
+        num_occupied,
+        intervals,
+        causal_states,
+        state_trait_ids,
+        state_trait_counts,
+        state_pair_indices,
+        state_pair_counts,
+        pair_index,
+        omega,
+        num_left,
+        num_right,
+        denominator,
+        sigma_numerator,
+        n_counts,
+        n_total,
+        z_threshold,
+        fit_ss,
+        pi_causal_ss,
+        candidate_fdr,
+    )
+
+
+@njit(inline="always")
+def _evaluate_counts_candidate(
+    counts,
+    intervals,
+    causal_states,
+    state_trait_ids,
+    state_trait_counts,
+    state_pair_indices,
+    state_pair_counts,
+    pair_index,
+    omega,
+    num_left,
+    num_right,
+    denominator,
+    sigma_numerator,
+    n_counts,
+    n_total,
+    z_threshold,
+    fit_ss,
+    pi_causal_ss,
+    candidate_fdr,
+):
+    """Evaluate one dense composition-count row."""
+    num_states = len(counts)
+    state_ids = np.empty(num_states, dtype=np.int64)
+    multiplicities = np.empty(num_states, dtype=np.int64)
+    num_occupied = 0
+    for state in range(num_states):
+        if counts[state] > 0:
+            state_ids[num_occupied] = state
+            multiplicities[num_occupied] = counts[state]
+            num_occupied += 1
+
+    return _evaluate_occupied_candidate(
+        state_ids,
+        multiplicities,
+        num_occupied,
+        intervals,
+        causal_states,
+        state_trait_ids,
+        state_trait_counts,
+        state_pair_indices,
+        state_pair_counts,
+        pair_index,
+        omega,
+        num_left,
+        num_right,
+        denominator,
+        sigma_numerator,
+        n_counts,
+        n_total,
+        z_threshold,
+        fit_ss,
+        pi_causal_ss,
+        candidate_fdr,
+    )
 
 
 @njit(parallel=True, cache=True)
@@ -636,6 +749,548 @@ def _evaluate_automatic_grid_max_chunk_sparse(
         block_ranks,
         block_feasible_counts,
         block_invalid,
+    )
+
+
+@njit(inline="always")
+def _branch_counts_survive(
+    counts,
+    intervals,
+    causal_states,
+    state_pair_indices,
+    state_pair_counts,
+    pair_index,
+    omega,
+    prune_tolerance,
+    fit_ss,
+    pi_causal_ss,
+):
+    """Apply safe principal-matrix pruning to one partial table."""
+    num_states, num_traits = causal_states.shape
+    num_pairs = num_traits * (num_traits + 1) // 2
+    pair_counts = np.zeros(num_pairs, dtype=np.int64)
+
+    for state in range(num_states):
+        count = counts[state]
+        if count == 0:
+            continue
+        for pair_offset in range(state_pair_counts[state]):
+            pair_counts[
+                state_pair_indices[state, pair_offset]
+            ] += count
+
+    for pair_number in range(num_pairs):
+        if pair_counts[pair_number] == 0:
+            return False
+
+    if fit_ss:
+        for trait in range(num_traits):
+            causal_probability = (
+                pair_counts[pair_index[trait, trait]] / intervals
+            )
+            if (
+                abs(causal_probability - pi_causal_ss[trait])
+                >= 1.0 / intervals
+            ):
+                return False
+
+    scaled_omega = np.empty(
+        (num_traits, num_traits), dtype=np.float64
+    )
+    for first_trait in range(num_traits):
+        for second_trait in range(num_traits):
+            scaled_omega[first_trait, second_trait] = (
+                omega[first_trait, second_trait]
+                * intervals
+                / pair_counts[pair_index[first_trait, second_trait]]
+            )
+
+    # The tolerance is an upper bound on the final full-matrix tolerance.
+    # Eigenvalue interlacing therefore makes this rejection conservative:
+    # no table accepted by the historical full PSD rule can be pruned here.
+    eigenvalues = np.linalg.eigvalsh(scaled_omega)
+    return eigenvalues[0] >= -prune_tolerance
+
+
+@njit(cache=True)
+def _enumerate_branch_seed_counts_kernel(
+    total_points,
+    intervals,
+    combinations,
+    causal_states,
+    state_pair_indices,
+    state_pair_counts,
+    pair_index,
+    omega,
+    prune_tolerance,
+    fit_ss,
+    pi_causal_ss,
+):
+    """Enumerate the small seed grid and retain safe partial tables."""
+    num_states = causal_states.shape[0]
+    retained = np.empty((total_points, num_states), dtype=np.int64)
+    retained_count = 0
+    counts = np.empty(num_states, dtype=np.int64)
+
+    for rank in range(total_points):
+        _unrank_composition(
+            rank, intervals, num_states, combinations, counts
+        )
+        if _branch_counts_survive(
+            counts,
+            intervals,
+            causal_states,
+            state_pair_indices,
+            state_pair_counts,
+            pair_index,
+            omega,
+            prune_tolerance,
+            fit_ss,
+            pi_causal_ss,
+        ):
+            retained[retained_count] = counts
+            retained_count += 1
+
+    return retained[:retained_count].copy()
+
+
+def enumerate_branch_seed_counts(
+    intervals,
+    causal_states,
+    omega,
+    prune_tolerance,
+    pi_causal_ss=None,
+):
+    """Return conservatively feasible count tables for a small trait seed."""
+    causal_states = np.asarray(causal_states, dtype=np.bool_)
+    omega = np.asarray(omega, dtype=np.float64)
+    num_states, num_traits = causal_states.shape
+    total_points = automatic_grid_size(num_states, intervals)
+    combinations = binomial_table(
+        intervals + num_states - 1,
+        max(num_states - 1, intervals),
+    )
+    causal_state_arrays = prepare_causal_state_arrays(causal_states)
+    if pi_causal_ss is None:
+        fit_ss = False
+        pi_causal_ss = np.zeros(num_traits, dtype=np.float64)
+    else:
+        fit_ss = True
+        pi_causal_ss = np.asarray(pi_causal_ss, dtype=np.float64)
+    return _enumerate_branch_seed_counts_kernel(
+        int(total_points),
+        int(intervals),
+        combinations,
+        causal_states,
+        causal_state_arrays[2],
+        causal_state_arrays[3],
+        causal_state_arrays[4],
+        omega,
+        float(prune_tolerance),
+        fit_ss,
+        pi_causal_ss,
+    )
+
+
+@njit(cache=True)
+def _expand_and_prune_counts_kernel(
+    parents,
+    max_children,
+    intervals,
+    causal_states,
+    state_pair_indices,
+    state_pair_counts,
+    pair_index,
+    omega,
+    prune_tolerance,
+    fit_ss,
+    pi_causal_ss,
+):
+    """Split each partial table for one new trait and prune descendants."""
+    parent_states = parents.shape[1]
+    child_states = parent_states * 2
+    retained = np.empty((max_children, child_states), dtype=np.int64)
+    retained_count = 0
+    visited = 0
+
+    for parent_index in range(len(parents)):
+        parent = parents[parent_index]
+        causal_counts = np.zeros(parent_states, dtype=np.int64)
+        child = np.empty(child_states, dtype=np.int64)
+        finished = False
+        while not finished:
+            visited += 1
+            for state in range(parent_states):
+                child[2 * state] = parent[state] - causal_counts[state]
+                child[2 * state + 1] = causal_counts[state]
+
+            if _branch_counts_survive(
+                child,
+                intervals,
+                causal_states,
+                state_pair_indices,
+                state_pair_counts,
+                pair_index,
+                omega,
+                prune_tolerance,
+                fit_ss,
+                pi_causal_ss,
+            ):
+                retained[retained_count] = child
+                retained_count += 1
+
+            position = parent_states - 1
+            while position >= 0:
+                if causal_counts[position] < parent[position]:
+                    causal_counts[position] += 1
+                    break
+                causal_counts[position] = 0
+                position -= 1
+            if position < 0:
+                finished = True
+
+    return retained[:retained_count].copy(), visited
+
+
+def branch_extension_count(parents):
+    """Count the exact number of one-trait table splits as a Python int."""
+    total = 0
+    for parent in np.asarray(parents):
+        total += math.prod(int(count) + 1 for count in parent)
+    return total
+
+
+def expand_and_prune_counts(
+    parents,
+    intervals,
+    causal_states,
+    omega,
+    prune_tolerance,
+    pi_causal_ss=None,
+):
+    """Expand one branch level and retain safe principal-matrix tables."""
+    parents = np.asarray(parents, dtype=np.int64)
+    causal_states = np.asarray(causal_states, dtype=np.bool_)
+    omega = np.asarray(omega, dtype=np.float64)
+    num_traits = causal_states.shape[1]
+    max_children = branch_extension_count(parents)
+    causal_state_arrays = prepare_causal_state_arrays(causal_states)
+    if pi_causal_ss is None:
+        fit_ss = False
+        pi_causal_ss = np.zeros(num_traits, dtype=np.float64)
+    else:
+        fit_ss = True
+        pi_causal_ss = np.asarray(pi_causal_ss, dtype=np.float64)
+    return _expand_and_prune_counts_kernel(
+        parents,
+        int(max_children),
+        int(intervals),
+        causal_states,
+        causal_state_arrays[2],
+        causal_state_arrays[3],
+        causal_state_arrays[4],
+        omega,
+        float(prune_tolerance),
+        fit_ss,
+        pi_causal_ss,
+    )
+
+
+def state_mapping_to_original_order(trait_order):
+    """Map state indices in a reordered trait basis to original indices."""
+    trait_order = np.asarray(trait_order, dtype=np.int64)
+    num_traits = len(trait_order)
+    num_states = 1 << num_traits
+    mapping = np.empty(num_states, dtype=np.int64)
+    for reordered_state in range(num_states):
+        original_state = 0
+        for reordered_trait, original_trait in enumerate(trait_order):
+            bit = (
+                reordered_state >> (num_traits - reordered_trait - 1)
+            ) & 1
+            original_state |= bit << (num_traits - original_trait - 1)
+        mapping[reordered_state] = original_state
+    return mapping
+
+
+@njit(cache=True)
+def _evaluate_branch_leaves_kernel(
+    reordered_counts,
+    reordered_to_original_state,
+    intervals,
+    causal_states,
+    state_trait_ids,
+    state_trait_counts,
+    state_pair_indices,
+    state_pair_counts,
+    pair_index,
+    omega,
+    num_left,
+    num_right,
+    denominator,
+    sigma_numerator,
+    n_counts,
+    n_total,
+    z_threshold,
+    fit_ss,
+    pi_causal_ss,
+):
+    """Evaluate complete branch leaves with exact historical semantics."""
+    num_states, num_traits = causal_states.shape
+    max_fdr = np.full(num_traits, -np.inf, dtype=np.float64)
+    best_counts = np.zeros((num_traits, num_states), dtype=np.int64)
+    candidate_fdr = np.empty(num_traits, dtype=np.float64)
+    original_counts = np.empty(num_states, dtype=np.int64)
+    feasible_count = 0
+    invalid = False
+
+    for row in range(len(reordered_counts)):
+        original_counts[:] = 0
+        for reordered_state in range(num_states):
+            original_counts[
+                reordered_to_original_state[reordered_state]
+            ] = reordered_counts[row, reordered_state]
+
+        if not _evaluate_counts_candidate(
+            original_counts,
+            intervals,
+            causal_states,
+            state_trait_ids,
+            state_trait_counts,
+            state_pair_indices,
+            state_pair_counts,
+            pair_index,
+            omega,
+            num_left,
+            num_right,
+            denominator,
+            sigma_numerator,
+            n_counts,
+            n_total,
+            z_threshold,
+            fit_ss,
+            pi_causal_ss,
+            candidate_fdr,
+        ):
+            continue
+
+        feasible_count += 1
+        for trait in range(num_traits):
+            value = candidate_fdr[trait]
+            if (
+                not math.isfinite(value)
+                or value < -1.0e-12
+                or value > 1.0 + 1.0e-12
+            ):
+                invalid = True
+            value = min(1.0, max(0.0, value))
+            if (
+                value > max_fdr[trait]
+                or (
+                    value == max_fdr[trait]
+                    and _count_vector_precedes(
+                        original_counts, best_counts[trait]
+                    )
+                )
+            ):
+                max_fdr[trait] = value
+                best_counts[trait] = original_counts
+
+    maximizing_probabilities = best_counts / intervals
+    return max_fdr, maximizing_probabilities, feasible_count, invalid
+
+
+@njit(inline="always")
+def _count_vector_precedes(first, second):
+    """Compare compositions in the historical simplex_walk order."""
+    for state in range(len(first)):
+        if first[state] != second[state]:
+            return first[state] < second[state]
+    return False
+
+
+def evaluate_automatic_grid_max_branch(
+    intervals,
+    causal_states,
+    omega,
+    prepared,
+    pi_causal_ss=None,
+    candidate_limit=10_000_000,
+    table_byte_limit=256 * 1024 * 1024,
+):
+    """Exactly maximize maxFDR by pruning impossible principal matrices."""
+    if intervals <= 0:
+        raise ValueError("maxFDR intervals must be positive")
+    causal_states = np.asarray(causal_states, dtype=np.bool_)
+    omega = np.asarray(omega, dtype=np.float64)
+    num_states, num_traits = causal_states.shape
+    if num_states != 1 << num_traits:
+        raise ValueError("branch maxFDR requires all binary causal states")
+
+    exhaustive_candidates = automatic_grid_size(num_states, intervals)
+    prune_scale_bound = max(
+        1.0,
+        intervals * float(np.max(np.sum(np.abs(omega), axis=1))),
+    )
+    prune_tolerance = (
+        np.finfo(np.float64).eps * prune_scale_bound * num_traits
+    )
+    if pi_causal_ss is None:
+        original_pi = None
+    else:
+        original_pi = np.asarray(pi_causal_ss, dtype=np.float64)
+
+    seed_traits = min(3, num_traits)
+    seed_candidates = automatic_grid_size(1 << seed_traits, intervals)
+    seed_required_bytes = seed_candidates * (1 << seed_traits) * 8
+    if (
+        seed_candidates > candidate_limit
+        or seed_required_bytes > table_byte_limit
+    ):
+        raise BranchSearchLimitExceeded(
+            "branch seed would visit {:,} candidates and allocate "
+            "approximately {:.1f} MiB".format(
+                seed_candidates,
+                seed_required_bytes / (1024.0 * 1024.0),
+            )
+        )
+    best_seed = None
+    best_order = None
+    seed_subsets_tested = 0
+    for seed_order in itertools.combinations(range(num_traits), seed_traits):
+        seed_subsets_tested += 1
+        seed_order_array = np.asarray(seed_order, dtype=np.int64)
+        seed_omega = omega[np.ix_(seed_order_array, seed_order_array)]
+        seed_states = np.asarray(
+            list(itertools.product((False, True), repeat=seed_traits)),
+            dtype=np.bool_,
+        )
+        seed_pi = (
+            None
+            if original_pi is None
+            else original_pi[seed_order_array]
+        )
+        retained = enumerate_branch_seed_counts(
+            intervals,
+            seed_states,
+            seed_omega,
+            prune_tolerance,
+            pi_causal_ss=seed_pi,
+        )
+        if best_seed is None or len(retained) < len(best_seed):
+            best_seed = retained
+            best_order = list(seed_order)
+
+    parents = best_seed
+    order = best_order
+    remaining = [trait for trait in range(num_traits) if trait not in order]
+    level_diagnostics = []
+    while remaining and len(parents):
+        extension_count = branch_extension_count(parents)
+        child_states = parents.shape[1] * 2
+        required_bytes = extension_count * child_states * 8
+        if (
+            extension_count > candidate_limit
+            or required_bytes > table_byte_limit
+        ):
+            raise BranchSearchLimitExceeded(
+                "branch level would visit {:,} candidates and allocate "
+                "approximately {:.1f} MiB".format(
+                    extension_count, required_bytes / (1024.0 * 1024.0)
+                )
+            )
+
+        best_children = None
+        best_trait = None
+        for candidate_trait in remaining:
+            candidate_order = order + [candidate_trait]
+            order_array = np.asarray(candidate_order, dtype=np.int64)
+            candidate_omega = omega[np.ix_(order_array, order_array)]
+            candidate_states = np.asarray(
+                list(
+                    itertools.product(
+                        (False, True), repeat=len(candidate_order)
+                    )
+                ),
+                dtype=np.bool_,
+            )
+            candidate_pi = (
+                None
+                if original_pi is None
+                else original_pi[order_array]
+            )
+            children, visited = expand_and_prune_counts(
+                parents,
+                intervals,
+                candidate_states,
+                candidate_omega,
+                prune_tolerance,
+                pi_causal_ss=candidate_pi,
+            )
+            if visited != extension_count:
+                raise RuntimeError("branch maxFDR extension count mismatch")
+            if best_children is None or len(children) < len(best_children):
+                best_children = children
+                best_trait = candidate_trait
+
+        order.append(best_trait)
+        remaining.remove(best_trait)
+        parents = best_children
+        level_diagnostics.append(
+            {
+                "trait": int(best_trait),
+                "candidates_per_choice": int(extension_count),
+                "choices_tested": int(len(remaining) + 1),
+                "retained": int(len(parents)),
+            }
+        )
+
+    if remaining:
+        order.extend(remaining)
+        parents = np.empty((0, num_states), dtype=np.int64)
+
+    prepared_arrays = prepare_fdr_arrays(prepared)
+    causal_state_arrays = prepare_causal_state_arrays(causal_states)
+    state_mapping = state_mapping_to_original_order(order)
+    if original_pi is None:
+        fit_ss = False
+        final_pi = np.zeros(num_traits, dtype=np.float64)
+    else:
+        fit_ss = True
+        final_pi = original_pi
+    max_fdr, maximizing_probabilities, feasible_count, invalid = (
+        _evaluate_branch_leaves_kernel(
+            parents,
+            state_mapping,
+            int(intervals),
+            causal_states,
+            *causal_state_arrays,
+            omega,
+            *prepared_arrays,
+            fit_ss,
+            final_pi,
+        )
+    )
+    if invalid:
+        raise ValueError(
+            "maxFDR branch search returned a non-finite value or a value "
+            "outside [0, 1]"
+        )
+    diagnostics = {
+        "exhaustive_candidates": int(exhaustive_candidates),
+        "trait_order": [int(trait) for trait in order],
+        "seed_traits": int(seed_traits),
+        "seed_candidates_per_subset": int(seed_candidates),
+        "seed_subsets_tested": int(seed_subsets_tested),
+        "seed_retained": int(len(best_seed)),
+        "levels": level_diagnostics,
+        "final_pruned_leaves": int(len(parents)),
+    }
+    return (
+        max_fdr,
+        maximizing_probabilities,
+        int(feasible_count),
+        diagnostics,
     )
 
 

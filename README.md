@@ -71,9 +71,22 @@ files remain the covariance source of truth.
 
 The maxFDR estimate is written to `results/mtag_max_fdr.txt`. With the Numba
 backend, the default max-only calculation keeps memory bounded and does not
-materialize the complete grid. Add `--fdr-write-full-grid` if you also need
-the historical probability-grid and FDR-matrix files. Custom `--grid_file`
-inputs currently use `--fdr-backend python`.
+materialize the complete grid. For five or more traits, it now uses an exact
+branch-and-prune search: it builds causal-state distributions a trait at a time
+and rejects a partial distribution only when its scaled Omega principal matrix
+proves that no PSD full matrix can descend from it. The surviving full
+distributions are evaluated with the same maxFDR calculation and historical
+grid-order tie-breaking as exhaustive search. This approach makes the process
+more efficient and does not require any approximations so does not change the
+output.
+
+`--fdr-search exhaustive` selects the bounded exhaustive Numba implementation
+as a compatibility reference. In automatic mode, a branch-search memory guard
+falls back to that implementation rather than risking an oversized temporary
+table. Add `--fdr-write-full-grid` if you also need the historical
+probability-grid and FDR-matrix files; full-grid output necessarily uses the
+exhaustive search. Custom `--grid_file` inputs currently use
+`--fdr-backend python`.
 
 ---
 
