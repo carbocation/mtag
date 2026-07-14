@@ -1,14 +1,102 @@
+# MTAG on Python 3 (`feature/python3`)
+
+This branch of [github.com/carbocation/mtag](https://github.com/carbocation/mtag/tree/feature/python3)
+ports MTAG to Python 3.10 or newer while retaining the original command-line
+interface and intended numerical behavior. It also makes the optimized Polars
+loader, writer, and Sigma estimator the defaults and provides an optional
+fused Numba backend for high-dimensional maxFDR searches.
+
+## Install this branch
+
+```bash
+git clone --branch feature/python3 --single-branch \
+  https://github.com/carbocation/mtag.git
+cd mtag
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.txt
+python mtag.py -h
+```
+
+Polars and bitarray are required by the default installation. For the faster
+native maxFDR backend, also install:
+
+```bash
+python -m pip install -r requirements-numba.txt
+```
+
+## Run MTAG
+
+The existing MTAG flags are preserved. A minimal two-trait run is:
+
+```bash
+mkdir -p results
+python mtag.py \
+  --sumstats trait1.tsv.gz,trait2.tsv.gz \
+  --out results/mtag
+```
+
+The default loader expects genuinely tab-delimited input for its Polars path.
+Arbitrary-whitespace and bzip2 inputs automatically use the fused pandas
+loader. Use `--legacy-loader` for the complete historical pandas I/O and Sigma
+estimation path; `--load-backend pandas` and `--output-backend pandas` select
+only those individual compatibility paths.
+
+## Run maxFDR separately
+
+Production workflows can finish and publish MTAG results before starting a
+potentially much longer maxFDR search:
+
+```bash
+python mtag.py \
+  --sumstats trait1.tsv.gz,trait2.tsv.gz \
+  --out results/mtag
+
+python mtag.py \
+  --skip_mtag \
+  --out results/mtag \
+  --intervals 10 \
+  --fdr-backend numba
+```
+
+Every standard MTAG run writes `results/mtag_maxfdr_inputs.npz`, a tiny
+sidecar containing the exact trait-wise sample-size means required by default
+`--n_approx`. The separate maxFDR process uses it automatically, so it does
+not reread the large trait result tables. Outputs created before this sidecar
+was introduced remain supported. `--fit_ss` and `--no-n-approx` still read the
+necessary SNP-level columns because those modes cannot use only trait means.
+The archive contains scalar `format_version` and `n_snps` fields plus an
+`n_approx` vector in input-trait order; the existing Omega and Sigma text
+files remain the covariance source of truth.
+
+The maxFDR estimate is written to `results/mtag_max_fdr.txt`. With the Numba
+backend, the default max-only calculation keeps memory bounded and does not
+materialize the complete grid. Add `--fdr-write-full-grid` if you also need
+the historical probability-grid and FDR-matrix files. Custom `--grid_file`
+inputs currently use `--fdr-backend python`.
+
+---
+
+## Historical upstream README (preserved verbatim below)
+
 # `mtag` (Multi-Trait Analysis of GWAS)
 
 `mtag` is a Python-based command line tool for jointly analyzing multiple sets of GWAS summary statistics as described by [Turley et. al. (2018)](https://www.nature.com/articles/s41588-017-0009-4). It can also be used as a tool to meta-analyze GWAS results.
 
 ## Getting Started
 
-MTAG requires Python 3.10 or newer. Install its runtime dependencies with:
+We recommend installing the [Anaconda python distribution](https://www.anaconda.com/download/) as it includes all of the packages listed below. It also makes updating packages relatively painless with the `conda update` command.
 
-```bash
-python -m pip install -r requirements.txt
-```
+To run `mtag`, you will need to have Python 2.7 installed with the following packages:
+
+* `numpy (>=1.13.1)`  
+* `scipy`
+* `pandas (>=0.18.1)`
+* `argparse`
+* `bitarray` (for `ldsc`)
+* `joblib`
+
+(Note: if you already have the Python 3 version of the Anaconda distribution installed, then you will need to create and activate a Python 2.7 environment to run `mtag`. See [here](https://conda.io/docs/user-guide/tasks/manage-environments.html#creating-an-environment-with-commands) for details.)
 
 
 `mtag` may be downloaded by cloning this github repository:
@@ -21,75 +109,6 @@ To test that the tool has been successfully installed, type:
 	./mtag.py -h
 
 You should see a list of command-line flags and a description of the program. If an error is thrown instead, then there was some problem with the installation process.
-
-### Faster summary-statistics I/O
-
-The default Rust-backed Polars path keeps input QC, multi-trait intersection,
-and allele harmonization outside Python until the final MTAG matrix is
-assembled. It also writes large result tables substantially faster:
-
-```bash
-python -m pip install -r requirements.txt
-python mtag.py --sumstats trait1.tsv.gz,trait2.tsv.gz --out results/mtag
-```
-
-Polars is single-threaded by default in MTAG so its speedup does not depend on
-additional loader parallelism. Callers can explicitly set
-`POLARS_MAX_THREADS` before starting Python if they want Polars to use a larger
-thread pool. The Polars loader requires a real tab delimiter; arbitrary
-whitespace and bzip2 inputs automatically use the fused pandas loader while
-retaining the faster Polars writer. Add `--legacy-loader` to use the original
-pandas loading, merge, and output behavior end to end. The narrower options
-`--load-backend pandas` and `--output-backend pandas` remain available for
-isolated comparisons.
-
-Sigma estimation also shares a single LD-reference alignment across all
-traits and reuses each trait's LDSC heritability regression across trait
-pairs. `--legacy-loader` retains the original repeated pairwise LDSC wrapper
-as part of the complete historical path.
-
-### maxFDR
-
-Run the maxFDR calculation together with MTAG by adding `--fdr`. The grid
-resolution is controlled by `--intervals`:
-
-```bash
-python mtag.py --sumstats trait1.txt,trait2.txt --out results/mtag \
-  --fdr --intervals 10
-```
-
-The calculation writes the maximum estimates to `results/mtag_max_fdr.txt`.
-The default Python engine also writes `results/mtag_fdr_mat.txt` and
-`results/mtag_prob_grid.txt`. To rerun maxFDR from an existing set of MTAG
-outputs, use the same output prefix with `--skip_mtag`:
-
-```bash
-python mtag.py --skip_mtag --out results/mtag --intervals 10
-```
-
-`--grid_file` accepts a whitespace-delimited custom probability grid,
-`--fit_ss` restricts the grid using fitted spike-slab causal probabilities,
-and `--no-n-approx` uses distinct SNP sample-size rows instead of the default
-trait-wise mean approximation.
-
-Large automatically generated grids can use the optional fused Numba engine:
-
-```bash
-python -m pip install -r requirements-numba.txt
-python mtag.py --sumstats trait1.txt,trait2.txt --out results/mtag \
-  --fdr --intervals 10 --fdr-backend numba --cores 8
-```
-
-The Numba engine generates and evaluates the automatic grid in native-code
-chunks while preserving grid order and maxFDR calculations; its first
-invocation includes a one-time compilation cost. By default it retains only
-each trait's maximum and the probability vector where that maximum first
-occurs. This max-only path evaluates only occupied causal states and reduces
-candidate blocks directly, so memory use remains bounded by
-`--fdr-chunk-size` (default 1,000,000 for max-only evaluation).
-Add `--fdr-write-full-grid` if the complete legacy probability-grid and FDR
-matrix outputs are required. Custom `--grid_file` inputs currently require
-`--fdr-backend python`.
 
 A tutorial that walks through an example use of `mtag` may be found in the wiki.
 

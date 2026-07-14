@@ -2047,6 +2047,168 @@ def save_mtag_results_U(args, comb_df):
         _write_output_frame(args, out_df, out_path, na_rep='NA')
 
 ## maxFDR Functions
+MAXFDR_INPUTS_FORMAT_VERSION = 1
+MAXFDR_INPUTS_SUFFIX = '_maxfdr_inputs.npz'
+
+
+def _maxfdr_inputs_path(output_prefix):
+    return output_prefix + MAXFDR_INPUTS_SUFFIX
+
+
+def _write_maxfdr_inputs(args, Ns):
+    """Save the sufficient sample-size statistics for default maxFDR."""
+    sample_sizes = np.asarray(Ns, dtype=float)
+    if (
+        sample_sizes.ndim != 2
+        or sample_sizes.shape[0] == 0
+        or sample_sizes.shape[1] == 0
+        or not np.all(np.isfinite(sample_sizes))
+        or np.any(sample_sizes <= 0.0)
+    ):
+        raise ValueError(
+            'Cannot save maxFDR inputs from an invalid sample-size matrix'
+        )
+
+    # fdr() historically rounds every SNP's N before taking trait means.
+    # Saving that already-aggregated value avoids both a numerical change and
+    # a later scan of every multi-gigabyte trait output.
+    n_approx = np.mean(np.round(sample_sizes), axis=0)
+    output_path = _maxfdr_inputs_path(args.out)
+    np.savez(
+        output_path,
+        format_version=np.asarray(MAXFDR_INPUTS_FORMAT_VERSION, dtype=np.int64),
+        n_approx=n_approx,
+        n_snps=np.asarray(sample_sizes.shape[0], dtype=np.int64),
+    )
+    logging.info(
+        'Saved compact inputs for a separate default maxFDR run to {}'.format(
+            output_path
+        )
+    )
+
+
+def _load_maxfdr_inputs(output_prefix):
+    """Load and validate the default maxFDR sufficient-statistics sidecar."""
+    input_path = _maxfdr_inputs_path(output_prefix)
+    with np.load(input_path, allow_pickle=False) as saved:
+        required = {'format_version', 'n_approx', 'n_snps'}
+        missing = required.difference(saved.files)
+        if missing:
+            raise ValueError(
+                '{} is missing required maxFDR fields: {}'.format(
+                    input_path, ', '.join(sorted(missing))
+                )
+            )
+        version = np.asarray(saved['format_version'])
+        n_approx = np.asarray(saved['n_approx'], dtype=float)
+        n_snps = np.asarray(saved['n_snps'])
+
+    if (
+        version.size != 1
+        or int(version.reshape(-1)[0]) != MAXFDR_INPUTS_FORMAT_VERSION
+    ):
+        raise ValueError(
+            '{} uses an unsupported maxFDR input format version'.format(
+                input_path
+            )
+        )
+    if n_snps.size != 1 or int(n_snps.reshape(-1)[0]) <= 0:
+        raise ValueError('{} contains an invalid SNP count'.format(input_path))
+    if (
+        n_approx.ndim != 1
+        or n_approx.size == 0
+        or not np.all(np.isfinite(n_approx))
+        or np.any(n_approx <= 0.0)
+    ):
+        raise ValueError(
+            '{} contains invalid maxFDR sample-size means'.format(input_path)
+        )
+    return n_approx.reshape(1, -1)
+
+
+def _mtag_trait_output_paths(output_prefix):
+    out_dir, out_file = os.path.split(output_prefix)
+    out_dir = out_dir or '.'
+    trait_pattern = re.compile(
+        r'^{}_trait_(\d+)\.txt$'.format(re.escape(out_file))
+    )
+    trait_numbers = sorted(
+        int(match.group(1))
+        for name in os.listdir(out_dir)
+        for match in [trait_pattern.match(name)]
+        if match is not None
+    )
+    if not trait_numbers:
+        raise ValueError(
+            'No MTAG trait output files found for --out {}'.format(
+                output_prefix
+            )
+        )
+    expected = list(range(1, trait_numbers[-1] + 1))
+    if trait_numbers != expected:
+        raise ValueError(
+            'MTAG trait output files for --out {} are not consecutively '
+            'numbered from 1'.format(output_prefix)
+        )
+    return [
+        '{}_trait_{}.txt'.format(output_prefix, trait_number)
+        for trait_number in trait_numbers
+    ]
+
+
+def _load_skip_mtag_sumstats(args):
+    """Load only the result columns required by the requested maxFDR mode."""
+    sidecar_path = _maxfdr_inputs_path(args.out)
+    if args.n_approx and not args.fit_ss and os.path.isfile(sidecar_path):
+        logging.info(
+            'Loading compact default maxFDR inputs from {}'.format(
+                sidecar_path
+            )
+        )
+        return _load_maxfdr_inputs(args.out), None, True
+
+    trait_paths = _mtag_trait_output_paths(args.out)
+    need_z = args.fit_ss
+    columns = ['N', 'Z'] if need_z else ['N']
+
+    if args.n_approx and not need_z:
+        if not os.path.isfile(sidecar_path):
+            logging.info(
+                'No compact maxFDR input file was found; scanning N from '
+                'legacy MTAG trait outputs.'
+            )
+        n_approx = []
+        for trait_path in trait_paths:
+            trait_n = pd.read_csv(
+                trait_path, index_col=None, sep=r'\s+', usecols=columns
+            )['N'].to_numpy(dtype=float)
+            if trait_n.size == 0:
+                raise ValueError(
+                    'MTAG trait output contains no SNPs: {}'.format(trait_path)
+                )
+            n_approx.append(np.mean(np.round(trait_n)))
+        return np.asarray(n_approx, dtype=float).reshape(1, -1), None, True
+
+    n_columns = []
+    z_columns = []
+    expected_rows = None
+    for trait_path in trait_paths:
+        trait_data = pd.read_csv(
+            trait_path, index_col=None, sep=r'\s+', usecols=columns
+        )
+        if expected_rows is None:
+            expected_rows = len(trait_data)
+        elif len(trait_data) != expected_rows:
+            raise ValueError('MTAG trait output files have unequal row counts')
+        n_columns.append(trait_data['N'].to_numpy(dtype=float))
+        if need_z:
+            z_columns.append(trait_data['Z'].to_numpy(dtype=float))
+
+    n_matrix = np.column_stack(n_columns)
+    z_matrix = np.column_stack(z_columns) if need_z else None
+    return n_matrix, z_matrix, False
+
+
 create_S = lambda P: np.asarray(list(itertools.product([False,True], repeat=P)))
 
 def MTAG_var_Z_jt_c(t, Omega, Omega_c, sigma_LD, Ns):
@@ -2447,9 +2609,11 @@ def _save_and_log_max_fdr(args, max_fdr, maximizing_probabilities):
     logging.info('Completed FDR calculations.')
 
 
-def fdr(args, Ns_f, Zs):
+def fdr(args, Ns_f, Zs, n_approx_precomputed=False):
     '''
-    Ns: Mx T matrix of sample sizes
+    Ns_f: MxT matrix of sample sizes. When n_approx_precomputed is true,
+    Ns_f must instead be the single row of already-rounded trait means saved
+    by _write_maxfdr_inputs.
     '''
     logging.info('Beginning maxFDR calculations. Depending on the number of grid points specified, this might take some time...')
 
@@ -2460,7 +2624,15 @@ def fdr(args, Ns_f, Zs):
     if not 0.0 < args.p_sig < 1.0:
         raise ValueError('maxFDR significance threshold must be strictly between 0 and 1')
 
-    Ns = np.asarray(np.round(Ns_f), dtype=float) # round to avoid decimals
+    if n_approx_precomputed and (not args.n_approx or args.fit_ss):
+        raise ValueError(
+            'Precomputed maxFDR sample-size means require --n_approx '
+            'without --fit_ss'
+        )
+    if n_approx_precomputed:
+        Ns = np.asarray(Ns_f, dtype=float)
+    else:
+        Ns = np.asarray(np.round(Ns_f), dtype=float) # round to avoid decimals
     if Ns.ndim != 2:
         raise ValueError('maxFDR sample sizes must be a two-dimensional matrix')
     M,T = Ns.shape
@@ -2500,7 +2672,14 @@ def fdr(args, Ns_f, Zs):
             logging.info('Trait {}: \t {:.3f}'.format(t, pi_causal_ss[t]))
 
     if args.n_approx:
-        N_vals = np.mean(Ns, axis=0, keepdims=True)
+        if n_approx_precomputed:
+            if M != 1:
+                raise ValueError(
+                    'Precomputed maxFDR sample-size means must contain one row'
+                )
+            N_vals = Ns
+        else:
+            N_vals = np.mean(Ns, axis=0, keepdims=True)
         N_weights = np.ones(1)
     else:
         Ns_unique, Ns_counts = np.unique(Ns, return_counts=True, axis=0)
@@ -2816,6 +2995,7 @@ def mtag(args):
     else:
         save_mtag_results(args, res_temp, Zs, N_raw, Fs, mtag_betas, mtag_se, mtag_factor)
         write_summary(args, Zs, N_raw, Fs, mtag_betas, mtag_se, mtag_factor)
+        _write_maxfdr_inputs(args, Ns)
 
     if args.fdr:
         fdr(args, Ns, Zs)
@@ -2872,7 +3052,7 @@ special_cases.add_argument('--force', default=False, action='store_true', help='
 
 fdr_opts = parser.add_argument_group(title='Max FDR calculation', description="These options are used for the calculation of an upper bound on the false disovery under the model described in Supplementary Note 1.1.4 of Turley et al. (2017). Note that there is one of three ways to define the space of grid points over which the upper bound is searched. ")
 fdr_opts.add_argument('--fdr', default=False, action='store_true', help='Perform max FDR calculations')
-fdr_opts.add_argument('--skip_mtag', default=False, action='store_true', help='Skip calculations of MTAG and perform FDR only.')
+fdr_opts.add_argument('--skip_mtag', default=False, action='store_true', help='Skip MTAG and perform maxFDR from an existing output prefix. Standard MTAG runs write a compact input sidecar used automatically with the default --n_approx; older outputs and SNP-level maxFDR modes remain supported through the trait result files.')
 fdr_opts.add_argument('--grid_file',default=None, action='store', help='Pre-set list of grid points. Users can define a list of grid points over which the search is conducted. The list of grid points should be passed in text file as a white-space delimited matrix of dimnesions, G x S, where G is the number of grid points and S = 2^T is the number of possible causal states for SNPs. States are ordered according to a tree-like recursive structure from right to left. For example, for 3 traits, with the triple TFT denoting the state for which SNPs are causal for State 1, not causal for state 2, and causal for state 3, then the column ordering of probabilities should be: \nFFF FFT FTF FTT TFF TFT TTF TTT\n There should be no headers, or row names in the file. Any rows for which (i) the probabilities do not sum to 1, the prior of a SNP being is causal is 0 for any of the traits, and (iii) the resulting genetic correlation matrix is non positive definite will excluded in the search.')
 fdr_opts.add_argument('--fit_ss', default=False, action='store_true', help='This estimates the prior probability that a SNP is null for each trait and then proceeds to restrict the grid search to the set of probability vectors that sum to the prior null for each trait. This is useful for restrict the search space of larger-dimensional traits.')
 fdr_opts.add_argument('--intervals', default=10, action='store',type=int, help='Number of intervals that you would like to partition the [0,1] interval. For example example, with two traits and --intervals set 10, then maxFDR will calculated over the set of feasible points in {0., 0.1, 0.2,..,0.9,1.0}^2.')
@@ -2917,34 +3097,23 @@ if __name__ == '__main__':
         if args.stream_stdout:
             logging.getLogger().addHandler(logging.StreamHandler()) # logging.infos to console
 
-        # parse output options
-        (out_dir, out_file) = os.path.split(args.out)
-        out_dir = out_dir or '.'
-        trait_pattern = re.compile(
-            r'^{}_trait_(\d+)\.txt$'.format(re.escape(out_file))
+        N_mat, Z_mat, n_approx_precomputed = _load_skip_mtag_sumstats(args)
+
+        # Keep the covariance text files as the source of truth so existing
+        # workflows that inspect or intentionally replace them behave as before.
+        args.sigma_hat = np.atleast_2d(
+            np.loadtxt(args.out + '_sigma_hat.txt')
         )
-        ofile_list = [x for x in os.listdir(out_dir) if trait_pattern.match(x)]
-        T = len(ofile_list)
-        if T == 0:
-            raise ValueError(
-                'No MTAG trait output files found for --out {}'.format(args.out)
-            )
-        df_d = dict()
+        args.omega_hat = np.atleast_2d(
+            np.loadtxt(args.out + '_omega_hat.txt')
+        )
 
-        # extract Ns and Zs
-        for t in range(T):
-            df_d[t] = pd.read_csv('{}_trait_{}.txt'.format(args.out, t+1), index_col=None, sep=r'\s+')
-            if t == 0:
-                N_mat = np.empty((len(df_d[t]), T))
-                Z_mat = np.empty((len(df_d[t]), T))
-            N_mat[:,t] = df_d[t]['N']    
-            Z_mat[:,t] = df_d[t]['Z']
-
-        # read in omega + sigma
-        args.sigma_hat = np.loadtxt('{}/{}_sigma_hat.txt'.format(out_dir, out_file))
-        args.omega_hat = np.loadtxt('{}/{}_omega_hat.txt'.format(out_dir, out_file))
-
-        fdr(args, N_mat, Z_mat)
+        fdr(
+            args,
+            N_mat,
+            Z_mat,
+            n_approx_precomputed=n_approx_precomputed,
+        )
 
     else:             
         try:

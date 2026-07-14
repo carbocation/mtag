@@ -219,6 +219,108 @@ def test_spike_slab_optimizer_uses_inverse_parameter_transform(monkeypatch):
     assert tau == pytest.approx(0.03)
 
 
+def test_precomputed_n_approx_matches_full_sample_size_matrix(tmp_path):
+    sample_sizes = np.array(
+        [
+            [10_000.2, 12_000.8],
+            [10_001.7, 11_999.1],
+            [9_998.6, 12_003.5],
+        ]
+    )
+    z_scores = np.zeros_like(sample_sizes)
+    expected_fdr, expected_grid = mtag.fdr(
+        _fdr_args(tmp_path / "full-sample-sizes"), sample_sizes, z_scores
+    )
+
+    precomputed_means = np.mean(
+        np.round(sample_sizes), axis=0, keepdims=True
+    )
+    actual_fdr, actual_grid = mtag.fdr(
+        _fdr_args(tmp_path / "precomputed-means"),
+        precomputed_means,
+        None,
+        n_approx_precomputed=True,
+    )
+
+    np.testing.assert_array_equal(actual_grid, expected_grid)
+    np.testing.assert_allclose(actual_fdr, expected_fdr, rtol=0.0, atol=0.0)
+
+
+def test_skip_mtag_cli_uses_compact_inputs_without_trait_files(tmp_path):
+    output_prefix = tmp_path / "compact-results"
+    sample_sizes = np.array(
+        [
+            [8_000.4, 20_000.6],
+            [10_000.8, 12_000.2],
+            [25_000.1, 9_000.9],
+        ]
+    )
+    mtag._write_maxfdr_inputs(
+        Namespace(out=str(output_prefix)), sample_sizes
+    )
+    np.savetxt(tmp_path / "compact-results_omega_hat.txt", OMEGA)
+    np.savetxt(tmp_path / "compact-results_sigma_hat.txt", SIGMA)
+    grid_path = tmp_path / "compact-grid.txt"
+    np.savetxt(grid_path, [[0.0, 0.5, 0.0, 0.5]])
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "mtag.py"),
+            "--skip_mtag",
+            "--out",
+            str(output_prefix),
+            "--grid_file",
+            str(grid_path),
+            "--intervals",
+            "2",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not list(tmp_path.glob("compact-results_trait*.txt"))
+    fdr_matrix = np.atleast_2d(
+        np.loadtxt(tmp_path / "compact-results_fdr_mat.txt")
+    )
+    assert fdr_matrix.shape == (1, 2)
+    assert np.isfinite(fdr_matrix).all()
+    fdr_log = (tmp_path / "compact-results.FDR.log").read_text()
+    assert "Loading compact default maxFDR inputs" in fdr_log
+
+
+def test_default_skip_mtag_falls_back_to_legacy_trait_outputs(tmp_path):
+    output_prefix = tmp_path / "legacy-results"
+    sample_sizes = (
+        np.array([8_000.4, 10_000.8, 25_000.1]),
+        np.array([20_000.6, 12_000.2, 9_000.9]),
+    )
+    for trait, trait_sample_sizes in enumerate(sample_sizes, start=1):
+        pd.DataFrame({"N": trait_sample_sizes, "Z": 0.0}).to_csv(
+            tmp_path / f"legacy-results_trait_{trait}.txt",
+            sep="\t",
+            index=False,
+        )
+
+    loaded_n, loaded_z, precomputed = mtag._load_skip_mtag_sumstats(
+        Namespace(
+            out=str(output_prefix),
+            n_approx=True,
+            fit_ss=False,
+        )
+    )
+
+    expected = np.array(
+        [[np.mean(np.round(trait_n)) for trait_n in sample_sizes]]
+    )
+    np.testing.assert_array_equal(loaded_n, expected)
+    assert loaded_z is None
+    assert precomputed is True
+
+
 def test_skip_mtag_cli_supports_single_row_grid_and_exact_sample_sizes(tmp_path):
     output_prefix = tmp_path / "prior-results"
     sample_sizes = (

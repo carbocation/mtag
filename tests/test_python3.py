@@ -260,6 +260,14 @@ def test_python3_cli_end_to_end_with_supplied_covariances(tmp_path):
 
     assert (tmp_path / "results_omega_hat.txt").exists()
     assert (tmp_path / "results_sigma_hat.txt").exists()
+    maxfdr_inputs_path = tmp_path / "results_maxfdr_inputs.npz"
+    assert maxfdr_inputs_path.exists()
+    with np.load(maxfdr_inputs_path, allow_pickle=False) as maxfdr_inputs:
+        assert int(maxfdr_inputs["format_version"]) == 1
+        assert int(maxfdr_inputs["n_snps"]) == 20
+        np.testing.assert_array_equal(
+            maxfdr_inputs["n_approx"], [10_000.0, 12_000.0]
+        )
     probability_grid = np.loadtxt(tmp_path / "results_prob_grid.txt")
     fdr_matrix = np.loadtxt(tmp_path / "results_fdr_mat.txt")
     np.testing.assert_allclose(
