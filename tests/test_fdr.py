@@ -98,12 +98,18 @@ def test_automatic_probability_grid_is_filtered_while_streaming(
 
     def tracked_filter(probability, causal_states):
         state["filtered"] = state["yielded"]
-        return True
+        return np.ones((causal_states.shape[1], causal_states.shape[1]))
 
     monkeypatch.setattr(mtag, "simplex_walk", tracked_grid)
-    monkeypatch.setattr(mtag, "some_causal_for_allT", tracked_filter)
+    monkeypatch.setattr(mtag, "_causal_pair_probabilities", tracked_filter)
     monkeypatch.setattr(mtag, "is_pos_semidef", lambda matrix: True)
-    monkeypatch.setattr(mtag, "compute_fdr", lambda *args: 0.25)
+    monkeypatch.setattr(
+        mtag,
+        "_compute_fdr_values",
+        lambda probability, omega, causal_states, prepared: np.full(
+            causal_states.shape[1], 0.25
+        ),
+    )
 
     fdr_matrix, probability_grid = mtag.fdr(
         _fdr_args(tmp_path / "streaming"),
@@ -114,6 +120,37 @@ def test_automatic_probability_grid_is_filtered_while_streaming(
     assert state["filtered"] == len(points) - 1
     np.testing.assert_allclose(probability_grid, points)
     np.testing.assert_allclose(fdr_matrix, 0.25)
+
+
+def test_fdr_precomputes_shared_terms_and_runs_once_per_grid_point(
+    tmp_path, monkeypatch
+):
+    prepare_calls = 0
+    compute_calls = 0
+    original_prepare = mtag._prepare_fdr_calculation
+    original_compute = mtag._compute_fdr_values
+
+    def tracked_prepare(*args, **kwargs):
+        nonlocal prepare_calls
+        prepare_calls += 1
+        return original_prepare(*args, **kwargs)
+
+    def tracked_compute(*args, **kwargs):
+        nonlocal compute_calls
+        compute_calls += 1
+        return original_compute(*args, **kwargs)
+
+    monkeypatch.setattr(mtag, "_prepare_fdr_calculation", tracked_prepare)
+    monkeypatch.setattr(mtag, "_compute_fdr_values", tracked_compute)
+    fdr_matrix, probability_grid = mtag.fdr(
+        _fdr_args(tmp_path / "shared-terms"),
+        np.array([[10_000.0, 12_000.0]]),
+        np.zeros((1, 2)),
+    )
+
+    assert prepare_calls == 1
+    assert compute_calls == len(probability_grid)
+    assert fdr_matrix.shape == (len(probability_grid), 2)
 
 
 def test_exact_sample_sizes_and_fitted_spike_slab_paths(tmp_path):

@@ -783,35 +783,81 @@ def cov2corr(cov, return_std=False):
 ## MTAG CALCULATION ####
 ########################
 
-def mtag_analysis(Zs, Ns, omega_hat, sigma_LD):
-    logging.info('Beginning MTAG calculations...')
-    M,P = Zs.shape
+def _sample_size_adjusted_covariance(Ns, covariance):
+    """Scale a trait covariance matrix by per-row sample sizes."""
+    inv_sqrt_n = 1.0 / np.sqrt(Ns)
+    return (
+        covariance[None, :, :]
+        * inv_sqrt_n[:, :, None]
+        * inv_sqrt_n[:, None, :]
+    )
 
-    W_N = np.einsum('mp,pq->mpq',np.sqrt(Ns),np.eye(P))
-    W_N_inv = np.linalg.inv(W_N)
-    Sigma_N =  np.einsum('mpq,mqr->mpr',np.einsum('mpq,qr->mpr',W_N_inv,sigma_LD),W_N_inv)
 
-    mtag_betas = np.zeros((M,P))
-    mtag_se = np.zeros((M,P))
-    mtag_factor = np.zeros((M,P))
+def _mtag_analysis_batch(Zs, Ns, omega_hat, sigma_LD):
+    """Run the main MTAG estimator for one in-memory SNP batch."""
+    M, P = Zs.shape
+    Sigma_N = _sample_size_adjusted_covariance(Ns, sigma_LD)
+    W_inv_Z = Zs / np.sqrt(Ns)
+
+    mtag_betas = np.empty((M, P), dtype=float)
+    mtag_se = np.empty((M, P), dtype=float)
+    mtag_factor = np.empty((M, P), dtype=float)
 
     for p in range(P):
-        # Note that in the code, what I call "gamma should really be omega", but avoid the latter term due to possible confusion with big Omega
-        gamma_k = omega_hat[:,p]
-        tau_k_2 = omega_hat[p,p]
-        om_min_gam = omega_hat - np.outer(gamma_k,gamma_k)/tau_k_2
+        # Note that in the code, what I call "gamma" should really be omega,
+        # but avoid the latter term due to possible confusion with big Omega.
+        gamma_k = omega_hat[:, p]
+        tau_k_2 = omega_hat[p, p]
+        om_min_gam = omega_hat - np.outer(gamma_k, gamma_k) / tau_k_2
+        xx = om_min_gam[None, :, :] + Sigma_N
+        yy = gamma_k / tau_k_2
 
-        xx = om_min_gam + Sigma_N
-        inv_xx = np.linalg.inv(xx)
-        yy = gamma_k/tau_k_2
-        W_inv_Z = np.einsum('mqp,mp->mq',W_N_inv,Zs)
+        # The legacy implementation formed yy.T @ inv(xx). Solving the
+        # transposed system yields the same vector without constructing a
+        # complete inverse for every SNP.
+        rhs = np.broadcast_to(yy, (M, P)).copy()[:, :, None]
+        weighted = np.linalg.solve(np.swapaxes(xx, 1, 2), rhs)[:, :, 0]
+        beta_denom = np.einsum('mp,p->m', weighted, yy)
 
-        beta_denom = np.einsum('mp,p->m',np.einsum('q,mqp->mp',yy,inv_xx),yy)
-        mtag_factor[:,p] = np.einsum('mp,m->m',np.einsum('q,mqp->mp',yy,inv_xx), 1/beta_denom)
-        mtag_var_p = 1. / beta_denom
+        mtag_factor[:, p] = np.einsum(
+            'mp,m->m', weighted, 1.0 / beta_denom
+        )
+        mtag_betas[:, p] = (
+            np.einsum('mp,mp->m', weighted, W_inv_Z) / beta_denom
+        )
+        mtag_se[:, p] = np.sqrt(1.0 / beta_denom)
 
-        mtag_betas[:,p] = np.einsum('mp,mp->m',np.einsum('q,mqp->mp',yy,inv_xx), W_inv_Z) / beta_denom
-        mtag_se[:,p] = np.sqrt(mtag_var_p)
+    return mtag_betas, mtag_se, mtag_factor
+
+
+def mtag_analysis(Zs, Ns, omega_hat, sigma_LD, batch_size=100000):
+    logging.info('Beginning MTAG calculations...')
+    Zs = np.asarray(Zs, dtype=float)
+    Ns = np.asarray(Ns, dtype=float)
+    omega_hat = np.asarray(omega_hat, dtype=float)
+    sigma_LD = np.asarray(sigma_LD, dtype=float)
+    if batch_size <= 0:
+        raise ValueError('MTAG batch size must be a positive integer')
+    if Zs.ndim != 2 or Ns.shape != Zs.shape:
+        raise ValueError('MTAG Z scores and sample sizes must be matching matrices')
+    M, P = Zs.shape
+    if omega_hat.shape != (P, P) or sigma_LD.shape != (P, P):
+        raise ValueError(
+            'MTAG covariance matrix dimensions must match the number of traits'
+        )
+
+    mtag_betas = np.empty((M, P), dtype=float)
+    mtag_se = np.empty((M, P), dtype=float)
+    mtag_factor = np.empty((M, P), dtype=float)
+
+    for start in range(0, M, batch_size):
+        stop = min(start + batch_size, M)
+        batch_results = _mtag_analysis_batch(
+            Zs[start:stop], Ns[start:stop], omega_hat, sigma_LD
+        )
+        mtag_betas[start:stop] = batch_results[0]
+        mtag_se[start:stop] = batch_results[1]
+        mtag_factor[start:stop] = batch_results[2]
 
     logging.info(' ... Completed MTAG calculations.')
     return mtag_betas, mtag_se, mtag_factor
@@ -990,10 +1036,7 @@ def MTAG_var_Z_jt_c(t, Omega, Omega_c, sigma_LD, Ns):
     '''
 
 
-    T = Ns.shape[1]
-    W_N = np.einsum('mp,pq->mpq',np.sqrt(Ns),np.eye(T))
-    W_N_inv = np.linalg.inv(W_N)
-    Sigma_j =  np.einsum('mpq,mqr->mpr',np.einsum('mpq,qr->mpr',W_N_inv,sigma_LD),W_N_inv)
+    Sigma_j = _sample_size_adjusted_covariance(Ns, sigma_LD)
 
     gamma_k = Omega[:,t]
     tau_k_2 = Omega[t,t]
@@ -1024,24 +1067,23 @@ def simplex_walk(num_dims, samples_per_dim):
         yield np.array([(y - x - 1.) / (samples_per_dim - 1.)
                for x, y in zip([-1] + c, c + [max_])])
 
+
+def _causal_pair_probabilities(priors, S):
+    """Return joint causal probabilities for every pair of traits."""
+    states = np.asarray(S, dtype=float)
+    priors = np.asarray(priors, dtype=float)
+    return states.T @ (priors[:, None] * states)
+
+
 def scale_omega(gen_corr_mat, priors, S=None):
     gen_corr_mat = np.asarray(gen_corr_mat, dtype=float)
     priors = np.asarray(priors, dtype=float)
     if gen_corr_mat.ndim != 2 or gen_corr_mat.shape[0] != gen_corr_mat.shape[1]:
         raise ValueError('genetic covariance matrix must be square')
     T = gen_corr_mat.shape[1]
-    omega = np.zeros_like(gen_corr_mat, dtype=float)
     if S is None:
         S = create_S(T)
-    n_S = len(S)
-    for p1 in range(T):
-        for p2 in range(T):
-            # indices of states that are casual for both traits p1 and p2.
-            caus_state = np.arange(n_S)[np.logical_and(S[:, p1], S[:, p2])]
-            # logging.info(np.sum(priors[caus_state]))
-            omega[p1,p2] = gen_corr_mat[p1,p2] / np.sum(priors[caus_state])
-
-    return omega
+    return gen_corr_mat / _causal_pair_probabilities(priors, S)
 
 
 def load_probability_grid(file_path, n_states, sum_tolerance=1.0e-8):
@@ -1079,39 +1121,84 @@ def load_probability_grid(file_path, n_states, sum_tolerance=1.0e-8):
         )
     return prob_grid
 
-def compute_fdr(prob, t, omega, sigma, S, Ns,N_counts, p_threshold):
-
-    z_threshold = scipy.stats.norm.isf(p_threshold / 2.) # magnitude of z-score needed for statistical significance
-    n_S, T = S.shape
-
-    omega_TT = scale_omega(omega, prob, S)
-
-    if not is_pos_semidef(omega_TT):
-        return np.inf
-
-    Omega_s = np.einsum('st,sr->str',S,S) * omega_TT
-
-
-
-    Prob_signif_cond_t = np.zeros(n_S)
-    power_state_t = np.zeros_like(Prob_signif_cond_t)
-
-
-    for k in range(len(S)):
-        sd = np.sqrt(MTAG_var_Z_jt_c(t, omega, Omega_s[k,:,:], sigma, Ns)) #ZZZ generalize to take in Omega_s rather than one state at a time .
-        Prob_signif_cond_t[k] = np.sum(2*scipy.stats.norm.sf(z_threshold, loc=0, scale = sd)*N_counts) / float(np.sum(N_counts)) # produces m FDR estimates: take average by weighting each unique sample size row with the counts of SNPs with that sample size (weighted average, denominator will be equal to M)
-
-        power_state_t[k] = Prob_signif_cond_t[k] * float(prob[k])
-
-    total_power = np.sum(power_state_t)
-    if not np.isfinite(total_power) or total_power <= 0.0:
-        raise ValueError(
-            'maxFDR could not calculate positive finite discovery power for '
-            'the supplied grid point'
+def _prepare_fdr_calculation(omega, sigma, Ns, N_counts, p_threshold):
+    """Precompute maxFDR terms invariant across grid points and states."""
+    sigma_by_n = _sample_size_adjusted_covariance(Ns, sigma)
+    trait_terms = []
+    for t in range(omega.shape[0]):
+        gamma_k = omega[:, t]
+        tau_k_2 = omega[t, t]
+        yy = gamma_k / tau_k_2
+        omega_conditional = omega - np.outer(gamma_k, gamma_k) / tau_k_2
+        inverse = np.linalg.inv(omega_conditional[None, :, :] + sigma_by_n)
+        num_left = np.einsum('p,mpq->mq', yy, inverse)
+        num_right = np.einsum('mpq,q->mp', inverse, yy)
+        denominator = np.einsum('p,mp->m', yy, num_right)
+        sigma_numerator = np.einsum(
+            'mp,mp->m',
+            num_left,
+            np.einsum('mpq,mq->mp', sigma_by_n, num_right),
         )
-    FDR_val = np.sum(power_state_t[~S[:,t]]) / total_power
+        trait_terms.append(
+            (num_left, num_right, denominator, sigma_numerator)
+        )
 
-    return FDR_val
+    return {
+        'n_counts': np.asarray(N_counts, dtype=float),
+        'n_total': float(np.sum(N_counts)),
+        'trait_terms': trait_terms,
+        'z_threshold': scipy.stats.norm.isf(p_threshold / 2.0),
+    }
+
+
+def _compute_fdr_values(prob, omega, S, prepared):
+    """Compute maxFDR for every trait at one causal-state grid point."""
+    omega_TT = scale_omega(omega, prob, S)
+    T = S.shape[1]
+    if not is_pos_semidef(omega_TT):
+        return np.full(T, np.inf)
+
+    omega_by_state = np.einsum('st,sr->str', S, S) * omega_TT
+    fdr_values = np.empty(T, dtype=float)
+    for t, trait_terms in enumerate(prepared['trait_terms']):
+        num_left, num_right, denominator, sigma_numerator = trait_terms
+        omega_numerator = np.einsum(
+            'mp,spq,mq->sm',
+            num_left,
+            omega_by_state,
+            num_right,
+            optimize=True,
+        )
+        variances = (
+            omega_numerator + sigma_numerator[None, :]
+        ) / denominator[None, :]
+        sd = np.sqrt(variances)
+        probability_significant = np.sum(
+            2.0
+            * scipy.stats.norm.sf(
+                prepared['z_threshold'], loc=0, scale=sd
+            )
+            * prepared['n_counts'][None, :],
+            axis=1,
+        ) / prepared['n_total']
+        power_by_state = probability_significant * prob
+        total_power = np.sum(power_by_state)
+        if not np.isfinite(total_power) or total_power <= 0.0:
+            raise ValueError(
+                'maxFDR could not calculate positive finite discovery power '
+                'for the supplied grid point'
+            )
+        fdr_values[t] = np.sum(power_by_state[~S[:, t]]) / total_power
+
+    return fdr_values
+
+
+def compute_fdr(prob, t, omega, sigma, S, Ns, N_counts, p_threshold):
+    """Compute maxFDR for one trait while preserving the public helper API."""
+    prepared = _prepare_fdr_calculation(
+        omega, sigma, Ns, N_counts, p_threshold
+    )
+    return _compute_fdr_values(prob, omega, S, prepared)[t]
 
 def is_pos_semidef(m):
     m = np.asarray(m, dtype=float)
@@ -1219,26 +1306,12 @@ def ss_estimation(args, betas, se, max_iter=1000, tol=1.0e-10,
 
 def some_causal_for_allT(probs, S):
     # probability of being causal is nonzero for all traits
-    n_S, T = S.shape
-    # print(probs)
-    if not np.all([np.sum(probs[S[:,t]]) > 0 for t in range(T)]):
-        return False
-    for p1 in range(T):
-        for p2 in range(T):
-            # indices of states that are casual for both traits p1 and p2.
-            caus_state = np.arange(n_S)[np.logical_and(S[:, p1], S[:, p2])]
-            # print(np.sum(priors[caus_state]))
-            if np.sum(probs[caus_state]) == 0:
-                return False
-    return True
+    return np.all(_causal_pair_probabilities(probs, S) > 0.0)
 
 def _FDR_par(func_args):
-    '''
-    FDR methods for parallelization
-    omega_hat, sigma_hat, S, Ns,
-    '''
-    probs, omega_hat, sigma_hat, S, Ns, N_counts, p_sig, g, t = func_args
-    return compute_fdr(probs, t, omega_hat, sigma_hat, S, Ns, N_counts, p_sig)  , (g,t)
+    """Compute all-trait maxFDR values for one grid point in a worker."""
+    probs, omega_hat, S, prepared, g = func_args
+    return _compute_fdr_values(probs, omega_hat, S, prepared), g
 
 def fdr(args, Ns_f, Zs):
     '''
@@ -1275,16 +1348,7 @@ def fdr(args, Ns_f, Zs):
     S = create_S(T)
     causal_prob = lambda x, SS: np.sum(np.einsum('s,st->st',x,SS),axis=0)
 
-    if args.grid_file is not None:
-        prob_grid = load_probability_grid(args.grid_file, len(S))
-    else:
-        # automate the creation of the probability grid
-        # one_dim_interval = np.linspace(0., 1., args.intervals +1)
-        prob_grid = simplex_walk(len(S)-1, args.intervals+1)
-    # exclude probabilities that have at least one trait with zero pi_causal
-    # exclude probabilities that don't yield a valid NPD matrix
-    prob_grid = [x for x in prob_grid if some_causal_for_allT(x,S) and is_pos_semidef(scale_omega(args.omega_hat, x,S))]
-
+    pi_causal_ss = None
     if args.fit_ss:
         Zs = np.asarray(Zs, dtype=float)
         if Zs.shape != Ns.shape or not np.all(np.isfinite(Zs)):
@@ -1301,8 +1365,28 @@ def fdr(args, Ns_f, Zs):
         for t in range(T):
             logging.info('Trait {}: \t {:.3f}'.format(t, pi_causal_ss[t]))
 
+    if args.grid_file is not None:
+        candidate_grid = load_probability_grid(args.grid_file, len(S))
+    else:
+        # automate the creation of the probability grid
+        # one_dim_interval = np.linspace(0., 1., args.intervals +1)
+        candidate_grid = simplex_walk(len(S)-1, args.intervals+1)
+    # exclude probabilities that have at least one trait with zero pi_causal
+    # exclude probabilities that don't yield a valid NPD matrix
+    prob_grid = []
+    for probabilities in candidate_grid:
+        pair_probabilities = _causal_pair_probabilities(probabilities, S)
+        if not np.all(pair_probabilities > 0.0):
+            continue
+        if pi_causal_ss is not None and not np.all(
+            np.abs(causal_prob(probabilities, S) - pi_causal_ss)
+            < (1.0 / args.intervals)
+        ):
+            continue
+        if is_pos_semidef(args.omega_hat / pair_probabilities):
+            prob_grid.append(probabilities)
 
-        prob_grid = [p for p in prob_grid if np.all(np.abs(causal_prob(p,S)-pi_causal_ss) < (1. / args.intervals) ) ]
+    if pi_causal_ss is not None:
         logging.info('{} probabilities remain after restricting to the grid points with causal probabilities less than one unit (i.e. 1/intervals) from the Spike-Slab fitted causal probabilities.'.format(len(prob_grid)))
 
     if len(prob_grid) == 0:
@@ -1328,37 +1412,34 @@ def fdr(args, Ns_f, Zs):
         N_weights = Ns_counts
         assert np.sum(N_weights) == len(Ns)
 
-    # # define parallelization function
-    # def _FDR_par(func_args):
-    #     '''
-    #     FDR methods for parallelization
-    #     omega_hat, sigma_hat, S, Ns,
-    #     '''
-    #     probs, g, t = func_args
-    #     return compute_fdr(probs, t, args.omega_hat, args.sigma_hat, S, Ns, args.p_sig)  , (g,t)
-
-    arg_list = [(probs, args.omega_hat, args.sigma_hat, S, N_vals,N_weights, args.p_sig, g, t) for t in range(T) for g, probs in enumerate(prob_grid)]
-    NN = len(arg_list)
+    prepared = _prepare_fdr_calculation(
+        args.omega_hat, args.sigma_hat, N_vals, N_weights, args.p_sig
+    )
+    NN = len(prob_grid)
     K = min(10, NN)
     start_fdr =time.time()
+    np.savetxt(args.out + '_prob_grid.txt', prob_grid, delimiter='\t')
 
     def run_grid_search(parallel=None):
         for k in range(K):
             k0 = int(k*NN / K)
             k1 = int((k+1) * NN / K)
-            sublist = arg_list[k0:k1] if k + 1 != K else arg_list[k0:]
+            task_arguments = (
+                (prob_grid[g], args.omega_hat, S, prepared, g)
+                for g in range(k0, k1)
+            )
             if parallel is None:
-                grid_results = [_FDR_par(f_args) for f_args in sublist]
+                grid_results = [_FDR_par(f_args) for f_args in task_arguments]
             else:
                 grid_results = parallel(
-                    joblib.delayed(_FDR_par)(f_args) for f_args in sublist
+                    joblib.delayed(_FDR_par)(f_args)
+                    for f_args in task_arguments
                 )
             logging.info('Grid search: {} percent finished. Time: \t{:.3f} min'.format((k+1)*100./K, (time.time()-start_fdr)/ 60.))
-            for FDR_gt, coord in grid_results:
-                FDR[coord[0], coord[1]] = FDR_gt
+            for fdr_values, grid_index in grid_results:
+                FDR[grid_index, :] = fdr_values
 
             np.savetxt(args.out + '_fdr_mat.txt', FDR, delimiter='\t')
-            np.savetxt(args.out + '_prob_grid.txt', prob_grid, delimiter='\t')
 
     if args.cores == 1:
         run_grid_search()

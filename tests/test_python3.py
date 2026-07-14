@@ -41,6 +41,56 @@ def test_mtag_analysis_regression_values():
     )
 
 
+def test_batched_mtag_analysis_matches_legacy_equations():
+    rng = np.random.default_rng(8128)
+    z_scores = rng.normal(size=(23, 4))
+    sample_sizes = rng.integers(50_000, 250_000, size=(23, 4)).astype(float)
+    raw_omega = rng.normal(size=(4, 4))
+    omega = raw_omega @ raw_omega.T
+    omega *= 2.0e-5 / np.mean(np.diag(omega))
+    omega += np.eye(4) * 1.0e-5
+    sigma = np.full((4, 4), 0.1)
+    np.fill_diagonal(sigma, 1.0)
+
+    w_n = np.einsum(
+        "mp,pq->mpq", np.sqrt(sample_sizes), np.eye(z_scores.shape[1])
+    )
+    w_n_inverse = np.linalg.inv(w_n)
+    sigma_n = np.einsum(
+        "mpq,mqr->mpr",
+        np.einsum("mpq,qr->mpr", w_n_inverse, sigma),
+        w_n_inverse,
+    )
+    expected = [np.zeros_like(z_scores) for _ in range(3)]
+    for trait in range(z_scores.shape[1]):
+        gamma = omega[:, trait]
+        tau_squared = omega[trait, trait]
+        inverse = np.linalg.inv(
+            omega
+            - np.outer(gamma, gamma) / tau_squared
+            + sigma_n
+        )
+        yy = gamma / tau_squared
+        weighted = np.einsum("q,mqp->mp", yy, inverse)
+        denominator = np.einsum("mp,p->m", weighted, yy)
+        w_inverse_z = np.einsum("mqp,mp->mq", w_n_inverse, z_scores)
+        expected[0][:, trait] = (
+            np.einsum("mp,mp->m", weighted, w_inverse_z) / denominator
+        )
+        expected[1][:, trait] = np.sqrt(1.0 / denominator)
+        expected[2][:, trait] = np.einsum(
+            "mp,m->m", weighted, 1.0 / denominator
+        )
+
+    actual = mtag.mtag_analysis(
+        z_scores, sample_sizes, omega, sigma, batch_size=7
+    )
+    for expected_array, actual_array in zip(expected, actual):
+        np.testing.assert_allclose(
+            actual_array, expected_array, rtol=1.0e-12, atol=1.0e-12
+        )
+
+
 def _write_sumstats(path, z_scores, sample_size):
     allele_pairs = [
         ("A", "G"),
