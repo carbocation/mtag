@@ -43,6 +43,11 @@ pandas loading, merge, and output behavior end to end. The narrower options
 `--load-backend pandas` and `--output-backend pandas` remain available for
 isolated comparisons.
 
+Sigma estimation also shares a single LD-reference alignment across all
+traits and reuses each trait's LDSC heritability regression across trait
+pairs. `--legacy-loader` retains the original repeated pairwise LDSC wrapper
+as part of the complete historical path.
+
 ### maxFDR
 
 Run the maxFDR calculation together with MTAG by adding `--fdr`. The grid

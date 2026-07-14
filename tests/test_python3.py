@@ -457,6 +457,7 @@ def test_python3_cli_estimates_covariances_from_bundled_ld_scores(tmp_path):
 
     rng = np.random.default_rng(20260713)
     z_1 = rng.normal(size=len(variants)) * 1.3
+    z_1[:2] = [7.0, -6.5]
     z_2 = 0.35 * z_1 + rng.normal(size=len(variants)) * 1.2
     for number, z_scores, sample_size in (
         (1, z_1, 100_000),
@@ -478,22 +479,30 @@ def test_python3_cli_estimates_covariances_from_bundled_ld_scores(tmp_path):
         sumstats.to_csv(tmp_path / f"input_trait_{number}.txt", sep=" ", index=False)
 
     output_prefix = tmp_path / "estimated"
+    common_command = [
+        sys.executable,
+        str(ROOT / "mtag.py"),
+        "--sumstats",
+        f"{tmp_path / 'input_trait_1.txt'},{tmp_path / 'input_trait_2.txt'}",
+        "--force",
+        "--median_z_cutoff",
+        "999",
+        "--n_min",
+        "0",
+        "--maf_min",
+        "0",
+    ]
     result = subprocess.run(
-        [
-            sys.executable,
-            str(ROOT / "mtag.py"),
-            "--sumstats",
-            f"{tmp_path / 'input_trait_1.txt'},{tmp_path / 'input_trait_2.txt'}",
-            "--out",
-            str(output_prefix),
-            "--force",
-            "--median_z_cutoff",
-            "999",
-            "--n_min",
-            "0",
-            "--maf_min",
-            "0",
-        ],
+        common_command + ["--out", str(output_prefix)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    legacy_prefix = tmp_path / "estimated_legacy_sigma"
+    legacy_result = subprocess.run(
+        common_command
+        + ["--out", str(legacy_prefix), "--legacy-loader"],
         cwd=ROOT,
         capture_output=True,
         text=True,
@@ -501,8 +510,17 @@ def test_python3_cli_estimates_covariances_from_bundled_ld_scores(tmp_path):
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
+    assert legacy_result.returncode == 0, (
+        legacy_result.stdout + legacy_result.stderr
+    )
     omega = np.loadtxt(tmp_path / "estimated_omega_hat.txt")
     sigma = np.loadtxt(tmp_path / "estimated_sigma_hat.txt")
+    legacy_sigma = np.loadtxt(
+        tmp_path / "estimated_legacy_sigma_sigma_hat.txt"
+    )
+    np.testing.assert_allclose(
+        sigma, legacy_sigma, rtol=1.0e-13, atol=1.0e-13
+    )
     assert omega.shape == sigma.shape == (2, 2)
     assert np.isfinite(omega).all()
     assert np.isfinite(sigma).all()

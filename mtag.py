@@ -19,6 +19,7 @@ from argparse import Namespace
 
 from ldsc_mod.ldscore import sumstats as sumstats_sig
 from ldsc_mod.ldscore import allele_info
+from ldsc_mod.ldscore import regressions as ldsc_reg
 
 import mtag_munge as munge_sumstats
 import warnings
@@ -1310,7 +1311,33 @@ def ldsc_matrix_formatter(result_rg, output_var):
                 exec('output_mat[i, j] = result_rg[i, j]{}'.format(output_var))
     return(output_mat)
 
-def estimate_sigma(data_df, args):
+def _sigma_ldsc_args(args, sumstats_frames=None):
+    """Construct the LDSC options shared by both Sigma implementations."""
+    h2_files = None
+    rg_files = args.sumstats
+    rg_out = '{}_rg_misc'.format(args.out)
+    return Namespace(
+        out=rg_out, bfile=None, l2=None, extract=None, keep=None,
+        ld_wind_snps=None, ld_wind_kb=None, ld_wind_cm=None,
+        print_snps=None, annot=None, thin_annot=False, cts_bin=None,
+        cts_break=None, cts_names=None, per_allele=False, pq_exp=None,
+        no_print_annot=False, maf=None, h2=h2_files, rg=rg_files,
+        ref_ld=None, ref_ld_chr=args.ld_ref_panel, w_ld=None,
+        w_ld_chr=args.ld_ref_panel, overlap_annot=False,
+        no_intercept=False, intercept_h2=None, intercept_gencov=None,
+        M=None, two_step=None, chisq_max=None, print_cov=False,
+        print_delete_vals=False, chunk_size=50, pickle=False,
+        invert_anyway=False, yes_really=False, n_blocks=200,
+        not_M_5_50=False, return_silly_things=False,
+        no_check_alleles=False, print_coefficients=False,
+        samp_prev=None, pop_prev=None, frqfile=None, h2_cts=None,
+        frqfile_chr=None, print_all_cts=False,
+        sumstats_frames=sumstats_frames, rg_mat=True,
+    )
+
+
+def _estimate_sigma_legacy(data_df, args):
+    """Original pairwise pandas/LDSC wrapper retained for validation."""
     sigma_hat = np.empty((args.P,args.P))
 
     args.munge_out = args.out+'_ldsc_temp/'
@@ -1339,12 +1366,9 @@ def estimate_sigma(data_df, args):
         gwas_ss_df[p] = gwas_ss_df[p].rename(columns=ld_ss_name)
 
     # run ldsc
-    h2_files = None
-    rg_files = args.sumstats
-    rg_out = '{}_rg_misc'.format(args.out)
-    rg_mat = True
-
-    args_ldsc_rg = Namespace(out=rg_out, bfile=None,l2=None,extract=None,keep=None, ld_wind_snps=None,ld_wind_kb=None, ld_wind_cm=None,print_snps=None, annot=None,thin_annot=False,cts_bin=None, cts_break=None,cts_names=None, per_allele=False, pq_exp=None, no_print_annot=False,maf=None,h2=h2_files, rg=rg_files,ref_ld=None,ref_ld_chr=args.ld_ref_panel, w_ld=None,w_ld_chr=args.ld_ref_panel,overlap_annot=False,no_intercept=False, intercept_h2=None, intercept_gencov=None,M=None,two_step=None, chisq_max=None,print_cov=False,print_delete_vals=False,chunk_size=50, pickle=False,invert_anyway=False,yes_really=False,n_blocks=200,not_M_5_50=False,return_silly_things=False,no_check_alleles=False,print_coefficients=False,samp_prev=None,pop_prev=None, frqfile=None, h2_cts=None, frqfile_chr=None,print_all_cts=False, sumstats_frames=[ gwas_ss_df[i] for i in range(args.P)], rg_mat=rg_mat)
+    args_ldsc_rg = _sigma_ldsc_args(
+        args, [gwas_ss_df[i] for i in range(args.P)]
+    )
 
     if args.no_overlap:
         sigma_hat = np.zeros((args.P, args.P))
@@ -1364,6 +1388,125 @@ def estimate_sigma(data_df, args):
     # logging.info(type(sigma_hat))
     logging.info(sigma_hat)
 
+    return sigma_hat
+
+
+def _as_ldsc_column(values):
+    """Return one contiguous float column in LDSC's expected shape."""
+    return np.ascontiguousarray(values, dtype=float).reshape((-1, 1))
+
+
+def estimate_sigma(data_df, args):
+    """Estimate Sigma after aligning to LDSC once for all trait pairs."""
+    if getattr(args, 'legacy_loader', False):
+        return _estimate_sigma_legacy(data_df, args)
+
+    start_time = time.time()
+    args_ldsc_rg = _sigma_ldsc_args(args)
+    trait_columns = []
+    for trait_index in range(args.P):
+        trait_columns.extend([
+            'Z{}'.format(trait_index), 'N{}'.format(trait_index)
+        ])
+    wide_sumstats = data_df[['SNP'] + trait_columns]
+    logger = Logger_to_Logging()
+    (
+        M_annot,
+        w_ld_cname,
+        ref_ld_cnames,
+        aligned,
+        _,
+    ) = sumstats_sig._read_ld_sumstats(
+        args_ldsc_rg,
+        logger,
+        None,
+        alleles=False,
+        dropna=True,
+        sumstats=wide_sumstats,
+    )
+    logging.info(
+        'Aligned all traits to {} LDSC regression SNPs once.'.format(
+            len(aligned)
+        )
+    )
+
+    ref_ld = np.ascontiguousarray(
+        aligned.loc[:, ref_ld_cnames].to_numpy(dtype=float)
+    )
+    w_ld = _as_ldsc_column(aligned[w_ld_cname].to_numpy())
+    z_columns = [
+        _as_ldsc_column(aligned['Z{}'.format(p)].to_numpy())
+        for p in range(args.P)
+    ]
+    n_columns = [
+        _as_ldsc_column(aligned['N{}'.format(p)].to_numpy())
+        for p in range(args.P)
+    ]
+    del aligned, wide_sumstats
+
+    n_blocks = min(args_ldsc_rg.n_blocks, len(ref_ld))
+    # estimate_rg converts intercept_h2 to a list before checking whether it
+    # is None, so its historical automatic two-step condition is unreachable.
+    # Preserve the one-step behavior MTAG actually executes.
+    twostep = args_ldsc_rg.two_step
+    intercept_h2 = [None] * args.P
+    intercept_gencov = [None] * args.P
+
+    # The original RG wrapper recomputed both Hsq models for every pair.
+    # With MTAG's already-intersected rows, each trait has the same LDSC SNP
+    # set, so one regression per trait is identical to the repeated versions.
+    hsq = []
+    for trait_index in range(args.P):
+        logging.info(
+            'Estimating LDSC heritability for phenotype {}.'.format(
+                trait_index + 1
+            )
+        )
+        hsq.append(ldsc_reg.Hsq(
+            np.square(z_columns[trait_index]),
+            ref_ld,
+            w_ld,
+            n_columns[trait_index],
+            M_annot,
+            n_blocks=n_blocks,
+            intercept=intercept_h2[trait_index],
+            twostep=twostep,
+        ))
+
+    sigma_hat = np.zeros((args.P, args.P), dtype=float)
+    for first in range(args.P):
+        last = first + 1 if args.no_overlap else args.P
+        for second in range(first, last):
+            logging.info(
+                'Estimating LDSC residual covariance for phenotypes {} and '
+                '{}.'.format(first + 1, second + 1)
+            )
+            gencov = ldsc_reg.Gencov(
+                z_columns[first],
+                z_columns[second],
+                ref_ld,
+                w_ld,
+                n_columns[first],
+                n_columns[second],
+                M_annot,
+                hsq[first].tot,
+                hsq[second].tot,
+                hsq[first].intercept,
+                hsq[second].intercept,
+                n_blocks=n_blocks,
+                intercept_gencov=intercept_gencov[second],
+                twostep=twostep,
+            )
+            covariance = float(np.asarray(gencov.intercept).item())
+            sigma_hat[first, second] = covariance
+            sigma_hat[second, first] = covariance
+
+    logging.info(
+        'Shared-alignment Sigma estimation took {:.3f} seconds.'.format(
+            time.time() - start_time
+        )
+    )
+    logging.info(sigma_hat)
     return sigma_hat
 
 def _posDef_adjustment(mat, scaling_factor=0.99,max_it=1000):
@@ -2561,11 +2704,17 @@ def mtag(args):
     # 4. Estimate Sigma
     if args.residcov_path is None:
         logging.info('Estimating sigma..')
+        sigma_start_time = time.time()
         if args.verbose:
             args.sigma_hat = estimate_sigma(DATA[not_SA], args)
         else:
             with DisableLogger():
                 args.sigma_hat = estimate_sigma(DATA[not_SA], args)
+        logging.info(
+            'Sigma estimation completed in {:.3f} seconds.'.format(
+                time.time() - sigma_start_time
+            )
+        )
 
     else:
         args.sigma_hat = _read_matrix(args.residcov_path)
