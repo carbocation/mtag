@@ -781,8 +781,18 @@ def cov2corr(cov, return_std=False):
 ## MTAG CALCULATION ####
 ########################
 
-def mtag_analysis(Zs, Ns, omega_hat, sigma_LD):
+def mtag_analysis(Zs, Ns, omega_hat, sigma_LD, use_cuda=False,
+                  cuda_device=0, cuda_batch_size=100000):
     logging.info('Beginning MTAG calculations...')
+    if use_cuda:
+        from mtag_cuda import mtag_analysis_cuda
+        results = mtag_analysis_cuda(
+            Zs, Ns, omega_hat, sigma_LD,
+            device=cuda_device, batch_size=cuda_batch_size
+        )
+        logging.info(' ... Completed MTAG calculations.')
+        return results
+
     M,P = Zs.shape
 
     W_N = np.einsum('mp,pq->mpq',np.sqrt(Ns),np.eye(P))
@@ -1289,8 +1299,17 @@ def fdr(args, Ns_f, Zs):
 def mtag(args):
 
     #1. Administrative checks
+    # Preserve compatibility with callers that construct an argparse Namespace
+    # rather than using this module's parser.
+    args.cuda = getattr(args, 'cuda', False)
+    args.cuda_device = getattr(args, 'cuda_device', 0)
+    args.cuda_batch_size = getattr(args, 'cuda_batch_size', 100000)
     if args.equal_h2 and not args.perfect_gencov:
         raise ValueError("--equal_h2 option used without --perfect_gencov. To use --equal_h2, --perfect_gencov must be also be included.")
+    if args.cuda and args.cuda_device < 0:
+        raise ValueError("--cuda_device must be non-negative")
+    if args.cuda and args.cuda_batch_size <= 0:
+        raise ValueError("--cuda_batch_size must be a positive integer")
 
      ## Instantiate log file and masthead
     logging.basicConfig(format='%(asctime)s %(message)s', filename=args.out + '.log', filemode='w', level=logging.INFO,datefmt='%Y/%m/%d/%I:%M:%S %p')
@@ -1418,7 +1437,12 @@ def mtag(args):
 
             # perform MTAG on each type of SNPs
             omega_sub, sigma_sub = args.omega_hat[tl[:,None],tl[None,:]], args.sigma_hat[tl[:,None],tl[None,:]]
-            mtag_betas, mtag_se, mtag_factor = mtag_analysis(Zs, Ns, omega_sub, sigma_sub)
+            mtag_betas, mtag_se, mtag_factor = mtag_analysis(
+                Zs, Ns, omega_sub, sigma_sub,
+                use_cuda=args.cuda,
+                cuda_device=args.cuda_device,
+                cuda_batch_size=args.cuda_batch_size
+            )
 
             # combine types of SNPs by traits <save_mtag_results>
 
@@ -1447,7 +1471,12 @@ def mtag(args):
         comb_flat = [list(comb_df[y].values())[0] for y in comb_df.keys()]
         assert DATA_U.shape[0] == np.sum(np.asarray([x.shape[0] for x in comb_flat]))
 
-    mtag_betas, mtag_se, mtag_factor = mtag_analysis(Zs, Ns, args.omega_hat, args.sigma_hat)
+    mtag_betas, mtag_se, mtag_factor = mtag_analysis(
+        Zs, Ns, args.omega_hat, args.sigma_hat,
+        use_cuda=args.cuda,
+        cuda_device=args.cuda_device,
+        cuda_batch_size=args.cuda_batch_size
+    )
 
     #7. Save sumstats to files
     if args.meta_format:
@@ -1538,6 +1567,11 @@ misc.add_argument('--verbose', default=False, action='store_true', help='When us
 misc.add_argument('--chunksize', default=1e7, type=int, help='Chunksize for reading in data.')
 misc.add_argument('--stream_stdout', default=False, action='store_true', help='Will streat mtag processing on console in addition to writing to log file.')
 misc.add_argument('--median_z_cutoff', default=DEFAULT_MEDIAN_Z_THRESHOLD, type=float, help='Maximum allowed median Z-score for sumstats during input QC')
+
+performance = parser.add_argument_group(title="Performance")
+performance.add_argument('--cuda', default=False, action='store_true', help='Run the main MTAG SNP calculation on an NVIDIA GPU using CuPy. Omega and Sigma estimation and maxFDR remain on the CPU.')
+performance.add_argument('--cuda_device', default=0, type=int, help='Zero-based CUDA device index used with --cuda. Default is 0.')
+performance.add_argument('--cuda_batch_size', default=100000, type=int, help='Number of SNPs transferred to the GPU per MTAG batch. Reduce this value if GPU memory is exhausted. Default is 100000.')
 
 if __name__ == '__main__':
     start_t = time.time()
