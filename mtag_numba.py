@@ -1886,8 +1886,8 @@ def _load_state_power_cache(
     pair_generation,
     signature_hash,
     scaled_omega,
-    num_left,
-    num_right,
+    num_left_by_state,
+    num_right_by_state,
     denominator,
     sigma_numerator,
     n_counts,
@@ -1899,6 +1899,7 @@ def _load_state_power_cache(
     cache_states,
     cache_powers,
     power_output,
+    omega_numerators,
 ):
     """Load or exactly compute all-trait power for one state/signature."""
     mixed_hash = signature_hash ^ (
@@ -1916,27 +1917,38 @@ def _load_state_power_cache(
         return True
 
     num_traits = scaled_omega.shape[0]
+    num_n_values = len(n_counts)
     sqrt_two = math.sqrt(2.0)
-    for trait in range(num_traits):
-        probability_significant = 0.0
-        for n_index in range(len(n_counts)):
-            omega_numerator = 0.0
-            for first_trait in range(num_traits):
+    omega_numerators[:] = 0.0
+    for n_index in range(num_n_values):
+        for first_trait in range(num_traits):
+            if not _sparse_state_has_trait(
+                state, first_trait, num_traits
+            ):
+                continue
+            for second_trait in range(num_traits):
                 if not _sparse_state_has_trait(
-                    state, first_trait, num_traits
+                    state, second_trait, num_traits
                 ):
                     continue
-                for second_trait in range(num_traits):
-                    if _sparse_state_has_trait(
-                        state, second_trait, num_traits
-                    ):
-                        omega_numerator += (
-                            num_left[trait, n_index, first_trait]
-                            * scaled_omega[first_trait, second_trait]
-                            * num_right[trait, n_index, second_trait]
-                        )
+                scale = scaled_omega[first_trait, second_trait]
+                for trait in range(num_traits):
+                    omega_numerators[n_index, trait] += (
+                        num_left_by_state[
+                            n_index, first_trait, trait
+                        ]
+                        * scale
+                        * num_right_by_state[
+                            n_index, second_trait, trait
+                        ]
+                    )
+
+    for trait in range(num_traits):
+        probability_significant = 0.0
+        for n_index in range(num_n_values):
             variance = (
-                omega_numerator + sigma_numerator[trait, n_index]
+                omega_numerators[n_index, trait]
+                + sigma_numerator[trait, n_index]
             ) / denominator[trait, n_index]
             sd = math.sqrt(variance)
             probability_significant += (
@@ -1961,8 +1973,8 @@ def _evaluate_one_streamed_leaf(
     trait_order,
     intervals,
     omega,
-    num_left,
-    num_right,
+    num_left_by_state,
+    num_right_by_state,
     denominator,
     sigma_numerator,
     n_counts,
@@ -1978,6 +1990,7 @@ def _evaluate_one_streamed_leaf(
     state_power,
     total_power,
     false_discovery_power,
+    omega_numerators,
     pair_cache_hashes,
     pair_cache_generations,
     pair_cache_valid,
@@ -2047,8 +2060,8 @@ def _evaluate_one_streamed_leaf(
             pair_generation,
             signature_hash,
             scaled_omega,
-            num_left,
-            num_right,
+            num_left_by_state,
+            num_right_by_state,
             denominator,
             sigma_numerator,
             n_counts,
@@ -2060,6 +2073,7 @@ def _evaluate_one_streamed_leaf(
             power_cache_states,
             power_cache_values,
             state_power,
+            omega_numerators,
         )
         if power_hit:
             power_hits += 1
@@ -2097,8 +2111,8 @@ def _depth_first_sparse_branch_kernel(
     ordered_omega,
     prune_tolerance,
     omega,
-    num_left,
-    num_right,
+    num_left_by_state,
+    num_right_by_state,
     denominator,
     sigma_numerator,
     n_counts,
@@ -2170,6 +2184,9 @@ def _depth_first_sparse_branch_kernel(
     state_power = np.empty(num_traits, dtype=np.float64)
     total_power = np.empty(num_traits, dtype=np.float64)
     false_discovery_power = np.empty(num_traits, dtype=np.float64)
+    omega_numerators = np.empty(
+        (len(n_counts), num_traits), dtype=np.float64
+    )
     level_visited = np.zeros(num_traits, dtype=np.int64)
     level_retained = np.zeros(num_traits, dtype=np.int64)
     fast_accepts = np.zeros(num_traits, dtype=np.int64)
@@ -2216,8 +2233,8 @@ def _depth_first_sparse_branch_kernel(
                     trait_order,
                     intervals,
                     omega,
-                    num_left,
-                    num_right,
+                    num_left_by_state,
+                    num_right_by_state,
                     denominator,
                     sigma_numerator,
                     n_counts,
@@ -2233,6 +2250,7 @@ def _depth_first_sparse_branch_kernel(
                     state_power,
                     total_power,
                     false_discovery_power,
+                    omega_numerators,
                     pair_cache_hashes,
                     pair_cache_generations,
                     pair_cache_valid,
@@ -2520,7 +2538,23 @@ def evaluate_automatic_grid_max_branch(
 
     order_array = np.asarray(order, dtype=np.int64)
     ordered_omega = omega[np.ix_(order_array, order_array)]
-    prepared_arrays = prepare_fdr_arrays(prepared)
+    (
+        num_left,
+        num_right,
+        denominator,
+        sigma_numerator,
+        n_counts,
+        n_total,
+        z_threshold,
+    ) = prepare_fdr_arrays(prepared)
+    # Keep output traits contiguous so their independent accumulators can be
+    # processed as lanes while retaining each trait's historical pair order.
+    num_left_by_state = np.ascontiguousarray(
+        np.transpose(num_left, (1, 2, 0))
+    )
+    num_right_by_state = np.ascontiguousarray(
+        np.transpose(num_right, (1, 2, 0))
+    )
     if original_pi is None:
         fit_ss = False
         final_pi = np.zeros(num_traits, dtype=np.float64)
@@ -2575,7 +2609,13 @@ def evaluate_automatic_grid_max_branch(
         ordered_omega,
         float(prune_tolerance),
         omega,
-        *prepared_arrays,
+        num_left_by_state,
+        num_right_by_state,
+        denominator,
+        sigma_numerator,
+        n_counts,
+        n_total,
+        z_threshold,
         fit_ss,
         ordered_pi,
         final_pi,

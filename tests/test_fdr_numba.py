@@ -386,6 +386,42 @@ def test_exact_branch_search_matches_exhaustive_numba(
     )
 
 
+def test_simd_branch_power_layout_matches_multiple_n_bins():
+    traits = 4
+    intervals = 3
+    rng = np.random.default_rng(8675309)
+    raw_omega = rng.normal(size=(traits, traits))
+    omega = raw_omega @ raw_omega.T + np.eye(traits)
+    omega *= 2.0e-5 / np.mean(np.diag(omega))
+    sigma = np.full((traits, traits), 0.05)
+    np.fill_diagonal(sigma, 1.0)
+    sample_sizes = np.array(
+        [
+            [75_000.0, 85_000.0, 95_000.0, 105_000.0],
+            [90_000.0, 100_000.0, 110_000.0, 120_000.0],
+        ]
+    )
+    prepared = mtag._prepare_fdr_calculation(
+        omega, sigma, sample_sizes, np.array([3.0, 2.0]), 5.0e-8
+    )
+    causal_states = mtag.create_S(traits)
+
+    expected = mtag_numba.evaluate_automatic_grid_max(
+        intervals,
+        causal_states,
+        omega,
+        prepared,
+        chunk_size=17,
+    )
+    actual = mtag_numba.evaluate_automatic_grid_max_branch(
+        intervals, traits, omega, prepared
+    )
+
+    assert actual[2] == expected[2]
+    np.testing.assert_array_equal(actual[0], expected[0])
+    np.testing.assert_array_equal(actual[1], expected[1])
+
+
 def test_verified_branch_caches_preserve_results_under_collisions():
     traits = 5
     intervals = 5
