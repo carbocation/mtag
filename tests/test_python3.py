@@ -301,28 +301,18 @@ def test_python3_cli_end_to_end_with_supplied_covariances(tmp_path):
         np.testing.assert_array_equal(
             maxfdr_inputs["n_approx"], [10_000.0, 12_000.0]
         )
-    probability_grid = np.loadtxt(tmp_path / "results_prob_grid.txt")
-    fdr_matrix = np.loadtxt(tmp_path / "results_fdr_mat.txt")
+    max_fdr = np.loadtxt(tmp_path / "results_max_fdr.txt")
     np.testing.assert_allclose(
-        probability_grid,
+        max_fdr,
         [
-            [0.0, 0.0, 0.0, 1.0],
-            [0.0, 0.0, 0.5, 0.5],
-            [0.0, 0.5, 0.0, 0.5],
-            [0.5, 0.0, 0.0, 0.5],
-        ],
-    )
-    np.testing.assert_allclose(
-        fdr_matrix,
-        [
-            [0.0, 0.0],
-            [0.0, 5.232765790830277e-08],
-            [5.227828076989659e-08, 0.0],
-            [5.224847071238093e-08, 5.229583678208338e-08],
+            5.227828076989659e-08,
+            5.232765790830277e-08,
         ],
         rtol=1.0e-10,
         atol=1.0e-15,
     )
+    assert not (tmp_path / "results_prob_grid.txt").exists()
+    assert not (tmp_path / "results_fdr_mat.txt").exists()
     assert (tmp_path / "results.log").exists()
 
 

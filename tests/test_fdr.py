@@ -21,6 +21,9 @@ SIGMA = np.array([[1.0, 0.1], [0.1, 1.0]])
 def _fdr_args(output_prefix, **overrides):
     values = {
         "cores": 1,
+        "fdr_backend": "python",
+        "fdr_search": "auto",
+        "fdr_write_full_grid": False,
         "fit_ss": False,
         "grid_file": None,
         "intervals": 2,
@@ -272,6 +275,8 @@ def test_skip_mtag_cli_uses_compact_inputs_without_trait_files(tmp_path):
             str(output_prefix),
             "--grid_file",
             str(grid_path),
+            "--fdr-backend",
+            "python",
             "--intervals",
             "2",
         ],
@@ -353,6 +358,8 @@ def test_skip_mtag_cli_supports_single_row_grid_and_exact_sample_sizes(tmp_path)
             output_prefix.name,
             "--grid_file",
             str(grid_path),
+            "--fdr-backend",
+            "python",
             "--no-n-approx",
             "--intervals",
             "2",

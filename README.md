@@ -4,8 +4,8 @@ This branch of
 [github.com/carbocation/mtag](https://github.com/carbocation/mtag/tree/feature/python3)
 ports MTAG to Python 3.10 or newer while retaining the original command-line
 interface and intended numerical behavior. It also makes the optimized Polars
-loader, writer, and Sigma estimator the defaults and provides an optional fused
-Numba backend for high-dimensional maxFDR searches.
+loader, writer, and Sigma estimator the defaults and uses the fused Numba
+backend by default for maxFDR searches.
 
 ## Install this branch
 
@@ -19,12 +19,8 @@ python -m pip install -r requirements.txt
 python mtag.py -h
 ```
 
-Polars and bitarray are required by the default installation. For the faster
-native maxFDR backend, also install:
-
-```bash
-python -m pip install -r requirements-numba.txt
-```
+Polars, bitarray, and Numba are required and installed by the standard
+`requirements.txt` environment.
 
 ## Run MTAG
 
@@ -56,8 +52,7 @@ python mtag.py \
 python mtag.py \
   --skip_mtag \
   --out results/mtag \
-  --intervals 10 \
-  --fdr-backend numba
+  --intervals 10
 ```
 
 Every standard MTAG run now writes `results/mtag_maxfdr_inputs.npz`, which
@@ -68,8 +63,8 @@ because those modes cannot use only trait means. The archive contains scalar
 `format_version` and `n_snps` fields plus an `n_approx` vector in input-trait
 order.
 
-The maxFDR estimate is written to `results/mtag_max_fdr.txt`. With the Numba
-backend, the default max-only calculation keeps memory bounded and does not
+The maxFDR estimate is written to `results/mtag_max_fdr.txt`. The default Numba
+backend keeps the max-only calculation memory-bounded and does not
 materialize the complete grid. For five or more traits, it now uses an exact
 branch-and-prune search: it builds causal-state distributions a trait at a time
 in an exact depth-first traversal and rejects a partial distribution only when

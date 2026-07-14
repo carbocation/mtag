@@ -2636,14 +2636,15 @@ def _FDR_par(func_args):
 
 
 def _run_numba_fdr_grid(args, num_traits, prepared, pi_causal_ss):
-    """Run the optional fused Numba automatic-grid maxFDR engine."""
+    """Run the default fused Numba automatic-grid maxFDR engine."""
     try:
         import numba
         import mtag_numba
     except ImportError as error:
         raise RuntimeError(
-            '--fdr_backend numba requires the optional Numba dependencies; '
-            'install requirements-numba.txt'
+            'The default maxFDR backend requires Numba; reinstall the '
+            'standard dependencies from requirements.txt or explicitly use '
+            '--fdr-backend python for the historical reference engine.'
         ) from error
 
     available_threads = numba.config.NUMBA_DEFAULT_NUM_THREADS
@@ -2917,7 +2918,7 @@ def fdr(args, Ns_f, Zs, n_approx_precomputed=False):
     prepared = _prepare_fdr_calculation(
         args.omega_hat, args.sigma_hat, N_vals, N_weights, args.p_sig
     )
-    fdr_backend = getattr(args, 'fdr_backend', 'python')
+    fdr_backend = getattr(args, 'fdr_backend', 'numba')
     if fdr_backend == 'numba':
         if args.grid_file is not None:
             raise ValueError(
@@ -3295,7 +3296,7 @@ fdr_opts.add_argument('--cores', default=1, action='store', type=int, help='Numb
 fdr_opts.add_argument('--p_sig', default=5.0e-8, type=float, action='store', help='P-value threshold used for statistical signifiance. Default is p=5.0e-8 (genome-wide significance).' )
 fdr_opts.add_argument('--n_approx', default=True, dest='n_approx', action='store_true', help='Speed up FDR calculation by replacing the sample size of a SNP for each trait by the mean across SNPs (for each trait). Recommended and enabled by default.')
 fdr_opts.add_argument('--no_n_approx', '--no-n-approx', dest='n_approx', action='store_false', help='Use each distinct row of SNP sample sizes in the maxFDR power calculation instead of trait means.')
-fdr_opts.add_argument('--fdr_backend', '--fdr-backend', choices=('python', 'numba'), default='python', help='maxFDR execution engine. The optional numba backend fuses automatic-grid generation and evaluation; install requirements-numba.txt first. Default is python.')
+fdr_opts.add_argument('--fdr_backend', '--fdr-backend', choices=('numba', 'python'), default='numba', help='maxFDR execution engine. The exact fused Numba implementation is the default. Use python explicitly for the historical reference engine or custom --grid-file inputs.')
 fdr_opts.add_argument('--fdr_search', '--fdr-search', choices=('auto', 'branch', 'exhaustive'), default='auto', help='Automatic-grid search strategy for the Numba backend. Auto uses exact branch-and-prune for five or more traits with max-only output and bounded exhaustive streaming otherwise. Use exhaustive as a compatibility reference.')
 fdr_opts.add_argument('--fdr_chunk_size', '--fdr-chunk-size', default=None, type=int, help='Number of automatic maxFDR candidates evaluated per native chunk with --fdr_backend numba. Defaults to 1000000 for max-only reduction and 100000 with --fdr-write-full-grid.')
 fdr_opts.add_argument('--fdr_write_full_grid', '--fdr-write-full-grid', action='store_true', help='With --fdr_backend numba, retain and write the complete feasible probability grid and FDR matrix instead of only the per-trait maxima.')

@@ -1,6 +1,9 @@
-"""Parity tests for the optional fused Numba maxFDR engine."""
+"""Parity tests for the default fused Numba maxFDR engine."""
 
 from argparse import Namespace
+from pathlib import Path
+import subprocess
+import sys
 
 import numpy as np
 import pytest
@@ -12,6 +15,7 @@ import mtag
 import mtag_numba
 
 
+ROOT = Path(__file__).resolve().parents[1]
 OMEGA = np.array([[0.5, 0.2], [0.2, 0.4]])
 SIGMA = np.array([[1.0, 0.1], [0.1, 1.0]])
 
@@ -1036,3 +1040,59 @@ def test_numba_backend_cli_options_parse():
     assert parsed.fdr_chunk_size == 4096
     assert parsed.fdr_search == "branch"
     assert parsed.fdr_write_full_grid
+
+
+def test_optimized_cli_paths_are_defaults_and_legacy_is_explicit():
+    defaults = mtag.parser.parse_args([])
+    assert defaults.load_backend == "polars"
+    assert defaults.output_backend == "polars"
+    assert defaults.fdr_backend == "numba"
+    assert defaults.fdr_search == "auto"
+    assert defaults.n_approx
+    assert not defaults.fdr_write_full_grid
+    assert not defaults.legacy_loader
+
+    compatibility = mtag.parser.parse_args(
+        ["--legacy-loader", "--fdr-backend", "python"]
+    )
+    assert compatibility.legacy_loader
+    assert compatibility.fdr_backend == "python"
+
+
+def test_default_skip_mtag_uses_exact_numba_auto_search(tmp_path):
+    traits = 5
+    output_prefix = tmp_path / "default-fast"
+    mtag._write_maxfdr_inputs(
+        Namespace(out=str(output_prefix)),
+        np.full((1, traits), 100_000.0),
+    )
+    np.savetxt(
+        tmp_path / "default-fast_omega_hat.txt",
+        np.eye(traits) * 1.0e-5,
+    )
+    np.savetxt(
+        tmp_path / "default-fast_sigma_hat.txt", np.eye(traits)
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "mtag.py"),
+            "--skip_mtag",
+            "--out",
+            str(output_prefix),
+            "--intervals",
+            "2",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / "default-fast_max_fdr.txt").exists()
+    assert not (tmp_path / "default-fast_prob_grid.txt").exists()
+    assert not (tmp_path / "default-fast_fdr_mat.txt").exists()
+    log = (tmp_path / "default-fast.FDR.log").read_text()
+    assert "Exact branch-and-prune maxFDR search" in log
