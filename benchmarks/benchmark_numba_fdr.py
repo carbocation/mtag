@@ -57,7 +57,16 @@ def main():
     parser.add_argument("--seed", type=int, default=8128)
     parser.add_argument("--p-threshold", type=float, default=5.0e-8)
     parser.add_argument("--threads", type=int, default=1)
-    parser.add_argument("--chunk-size", type=int, default=100_000)
+    parser.add_argument("--chunk-size", type=int, default=1_000_000)
+    parser.add_argument(
+        "--sample-chunks",
+        type=int,
+        default=0,
+        help=(
+            "Sample this many evenly spaced chunks instead of enumerating "
+            "the complete Python reference grid"
+        ),
+    )
     args = parser.parse_args()
     numba.set_num_threads(args.threads)
 
@@ -72,6 +81,86 @@ def main():
     total_points = mtag_numba.automatic_grid_size(
         len(states), args.intervals
     )
+
+    if args.sample_chunks:
+        if args.sample_chunks <= 0:
+            raise ValueError("--sample-chunks must be positive")
+        prepared_arrays = mtag_numba.prepare_fdr_arrays(prepared)
+        state_arrays = mtag_numba.prepare_causal_state_arrays(states)
+        combinations = mtag_numba.binomial_table(
+            args.intervals + len(states) - 1,
+            max(len(states) - 1, args.intervals),
+        )
+        pi_causal_ss = np.zeros(args.traits)
+        starts = np.linspace(
+            0,
+            total_points - min(args.chunk_size, total_points),
+            args.sample_chunks,
+            dtype=np.int64,
+        )
+        warmup_stop = min(total_points, 2)
+        mtag_numba._evaluate_automatic_grid_max_chunk_sparse(
+            0,
+            warmup_stop,
+            total_points,
+            args.intervals,
+            combinations,
+            states,
+            *state_arrays,
+            omega,
+            *prepared_arrays,
+            False,
+            pi_causal_ss,
+        )
+
+        sampled_candidates = 0
+        feasible_count = 0
+        start_time = time.perf_counter()
+        for start_rank in starts:
+            stop_rank = min(
+                int(start_rank) + args.chunk_size, total_points
+            )
+            _, _, block_counts, invalid = (
+                mtag_numba._evaluate_automatic_grid_max_chunk_sparse(
+                    int(start_rank),
+                    stop_rank,
+                    total_points,
+                    args.intervals,
+                    combinations,
+                    states,
+                    *state_arrays,
+                    omega,
+                    *prepared_arrays,
+                    False,
+                    pi_causal_ss,
+                )
+            )
+            assert not np.any(invalid)
+            sampled_candidates += stop_rank - int(start_rank)
+            feasible_count += int(np.sum(block_counts))
+        sample_seconds = time.perf_counter() - start_time
+        candidate_rate = sampled_candidates / sample_seconds
+
+        print("Traits / intervals: {} / {}".format(
+            args.traits, args.intervals
+        ))
+        print("Candidate points:    {:,}".format(total_points))
+        print("Sampled points:      {:,}".format(sampled_candidates))
+        print("Sample feasible:     {:,}".format(feasible_count))
+        print("Numba threads:       {}".format(args.threads))
+        print("Candidate rate:      {:,.0f} / second".format(
+            candidate_rate
+        ))
+        projected_seconds = total_points / candidate_rate
+        if projected_seconds < 3600.0:
+            print("Projected runtime:   {:.2f} minutes".format(
+                projected_seconds / 60.0
+            ))
+        else:
+            print("Projected runtime:   {:.2f} hours".format(
+                projected_seconds / 3600.0
+            ))
+        return
 
     # Compile outside the timed region.
     mtag_numba.evaluate_automatic_grid_chunk(

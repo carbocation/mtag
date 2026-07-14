@@ -222,6 +222,62 @@ def set_default_cnames(args):
             args.a2_name: 'A2',
             args.p_name: "P"}
 
+
+def _internal_column_renames(columns, args):
+    """Choose at most one input column for each canonical MTAG name.
+
+    The legacy alias map renames every recognized spelling.  If a file has,
+    for example, both ``P_BOLT_LMM_INF`` and ``P_BOLT_LMM``, that produces two
+    columns named ``P``.  Older pandas versions allowed the duplicate labels,
+    while current pandas refuses to reindex any such frame.  Prefer columns
+    named explicitly by the user and use the broad alias map only as a
+    fallback, leaving unselected aliases untouched.
+    """
+    columns = list(columns)
+    broad_renames = munge_sumstats.set_default_cnames(args)
+    requested_renames = set_default_cnames(args)
+    selected_sources = {}
+
+    for source, target in requested_renames.items():
+        if source is None or source not in columns:
+            continue
+        previous = selected_sources.get(target)
+        if previous is not None and previous != source:
+            raise ValueError(
+                'Input columns {} and {} were both selected for internal '
+                'column {}.'.format(previous, source, target)
+            )
+        selected_sources[target] = source
+
+    alias_targets = {
+        broad_renames[source]
+        for source in columns
+        if source in broad_renames
+    }
+    for target in alias_targets:
+        if target in selected_sources:
+            continue
+        if target in columns:
+            selected_sources[target] = target
+            continue
+        selected_sources[target] = next(
+            source for source in columns if broad_renames.get(source) == target
+        )
+
+    renames = {}
+    for target, source in selected_sources.items():
+        if source != target:
+            renames[source] = target
+            if target in columns:
+                replacement = target + '_unselected'
+                suffix = 2
+                while replacement in columns or replacement in renames.values():
+                    replacement = '{}_unselected_{}'.format(target, suffix)
+                    suffix += 1
+                renames[target] = replacement
+
+    return renames
+
 def load_and_merge_data(args):
     '''
     Parses file names from MTAG command line arguments and returns the relevant used for method.
@@ -289,8 +345,10 @@ def load_and_merge_data(args):
         else:
             if z_checker < 1.02:
                 logging.info("Warning: The mean chi2 statistic of trait {} is less 1.02 - MTAG estimates may be unstable.".format(p+1))
-            GWAS_d[p].rename(columns=munge_sumstats.set_default_cnames(args), inplace=True)
-            GWAS_d[p].rename(columns=set_default_cnames(args), inplace=True)
+            GWAS_d[p].rename(
+                columns=_internal_column_renames(GWAS_d[p].columns, args),
+                inplace=True,
+            )
             GWAS_d[p] = GWAS_d[p].add_suffix(p)
 
         # flag inconsistency change
@@ -1368,13 +1426,20 @@ def _run_numba_fdr_grid(args, causal_states, prepared, pi_causal_ss):
         if getattr(args, 'fdr_write_full_grid', False)
         else mtag_numba.evaluate_automatic_grid_max
     )
+    chunk_size = getattr(args, 'fdr_chunk_size', None)
+    if chunk_size is None:
+        chunk_size = (
+            100000
+            if getattr(args, 'fdr_write_full_grid', False)
+            else 1000000
+        )
     return evaluation_function(
         args.intervals,
         causal_states,
         args.omega_hat,
         prepared,
         pi_causal_ss=pi_causal_ss,
-        chunk_size=getattr(args, 'fdr_chunk_size', 100000),
+        chunk_size=chunk_size,
         progress_callback=report_progress,
     )
 
@@ -1842,7 +1907,7 @@ fdr_opts.add_argument('--p_sig', default=5.0e-8, type=float, action='store', hel
 fdr_opts.add_argument('--n_approx', default=True, dest='n_approx', action='store_true', help='Speed up FDR calculation by replacing the sample size of a SNP for each trait by the mean across SNPs (for each trait). Recommended and enabled by default.')
 fdr_opts.add_argument('--no_n_approx', '--no-n-approx', dest='n_approx', action='store_false', help='Use each distinct row of SNP sample sizes in the maxFDR power calculation instead of trait means.')
 fdr_opts.add_argument('--fdr_backend', '--fdr-backend', choices=('python', 'numba'), default='python', help='maxFDR execution engine. The optional numba backend fuses automatic-grid generation and evaluation; install requirements-numba.txt first. Default is python.')
-fdr_opts.add_argument('--fdr_chunk_size', '--fdr-chunk-size', default=100000, type=int, help='Number of automatic maxFDR candidates evaluated per native chunk with --fdr_backend numba. Default is 100000.')
+fdr_opts.add_argument('--fdr_chunk_size', '--fdr-chunk-size', default=None, type=int, help='Number of automatic maxFDR candidates evaluated per native chunk with --fdr_backend numba. Defaults to 1000000 for max-only reduction and 100000 with --fdr-write-full-grid.')
 fdr_opts.add_argument('--fdr_write_full_grid', '--fdr-write-full-grid', action='store_true', help='With --fdr_backend numba, retain and write the complete feasible probability grid and FDR matrix instead of only the per-trait maxima.')
 
 # fdr_opts.add_argument('--binned_n', default=False, action='store_true', help='When --n_approx is off, this options allows for a sped-up version of the max_FDR calculation by weighting the power calculations of unique rows.')

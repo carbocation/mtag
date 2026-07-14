@@ -1,6 +1,7 @@
 """Python 3 regression and command-line smoke tests for MTAG."""
 
 from pathlib import Path
+from argparse import Namespace
 import subprocess
 import sys
 
@@ -12,6 +13,75 @@ import mtag
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _column_name_args(**overrides):
+    values = {
+        "snp_name": "snpid",
+        "z_name": "z",
+        "n_name": "n",
+        "beta_name": "beta",
+        "se_name": "se",
+        "eaf_name": "freq",
+        "chr_name": "chr",
+        "bpos_name": "bpos",
+        "a1_name": "a1",
+        "a2_name": "a2",
+        "p_name": "p",
+    }
+    values.update(overrides)
+    return Namespace(**values)
+
+
+def test_internal_column_renames_prioritize_explicit_aliases_without_duplicates():
+    columns = [
+        "SNP",
+        "ALLELE1",
+        "ALLELE0",
+        "A1FREQ",
+        "Z",
+        "P_BOLT_LMM_INF",
+        "P_BOLT_LMM",
+        "N",
+    ]
+    args = _column_name_args(
+        snp_name="SNP",
+        z_name="Z",
+        n_name="N",
+        eaf_name="A1FREQ",
+        a1_name="ALLELE1",
+        a2_name="ALLELE0",
+        p_name="P_BOLT_LMM",
+    )
+
+    renames = mtag._internal_column_renames(columns, args)
+    renamed_columns = [renames.get(column, column) for column in columns]
+
+    assert renames["P_BOLT_LMM"] == "P"
+    assert "P_BOLT_LMM_INF" not in renames
+    assert len(renamed_columns) == len(set(renamed_columns))
+
+
+def test_internal_column_renames_retain_legacy_alias_fallbacks():
+    columns = ["SNP", "A1", "A2", "A1FREQ", "Z", "PVAL", "N"]
+
+    renames = mtag._internal_column_renames(columns, _column_name_args())
+
+    assert renames == {"A1FREQ": "FRQ", "PVAL": "P"}
+
+
+def test_internal_column_renames_displace_unselected_canonical_column():
+    columns = ["SNP", "Z", "P", "P_BOLT_LMM", "N"]
+    args = _column_name_args(
+        snp_name="SNP", z_name="Z", n_name="N", p_name="P_BOLT_LMM"
+    )
+
+    renames = mtag._internal_column_renames(columns, args)
+    renamed_columns = [renames.get(column, column) for column in columns]
+
+    assert renames["P_BOLT_LMM"] == "P"
+    assert renames["P"] == "P_unselected"
+    assert len(renamed_columns) == len(set(renamed_columns))
 
 
 def test_mtag_analysis_regression_values():

@@ -65,7 +65,9 @@ The Numba engine generates and evaluates the automatic grid in native-code
 chunks while preserving grid order and maxFDR calculations; its first
 invocation includes a one-time compilation cost. By default it retains only
 each trait's maximum and the probability vector where that maximum first
-occurs, so memory use remains bounded by `--fdr-chunk-size` (default 100,000).
+occurs. This max-only path evaluates only occupied causal states and reduces
+candidate blocks directly, so memory use remains bounded by
+`--fdr-chunk-size` (default 1,000,000 for max-only evaluation).
 Add `--fdr-write-full-grid` if the complete legacy probability-grid and FDR
 matrix outputs are required. Custom `--grid_file` inputs currently require
 `--fdr-backend python`.
