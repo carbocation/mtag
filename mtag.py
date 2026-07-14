@@ -1855,6 +1855,105 @@ def _mtag_analysis_batch(Zs, Ns, omega_hat, sigma_LD):
     return mtag_betas, mtag_se, mtag_factor
 
 
+def _group_sample_size_rows(sample_sizes):
+    """Return exact unique sample-size rows and their inverse mapping."""
+    pl = _polars_module()
+    columns = [
+        '_mtag_n_{}'.format(trait)
+        for trait in range(sample_sizes.shape[1])
+    ]
+    frame = pl.DataFrame(
+        {
+            column: sample_sizes[:, trait]
+            for trait, column in enumerate(columns)
+        }
+    )
+    unique = frame.unique(maintain_order=False).with_row_index(
+        '_mtag_n_group'
+    )
+    inverse = (
+        frame.join(
+            unique,
+            on=columns,
+            how='left',
+            maintain_order='left',
+        )['_mtag_n_group']
+        .to_numpy()
+    )
+    return unique.select(columns).to_numpy(), inverse
+
+
+def _mtag_weight_systems(sample_sizes, omega_hat, sigma_LD):
+    """Solve the MTAG weight systems for distinct sample-size rows."""
+    rows, traits = sample_sizes.shape
+    sigma_n = _sample_size_adjusted_covariance(
+        sample_sizes, sigma_LD
+    )
+    weighted = np.empty((traits, rows, traits), dtype=float)
+    denominators = np.empty((traits, rows), dtype=float)
+
+    for trait in range(traits):
+        gamma = omega_hat[:, trait]
+        tau_squared = omega_hat[trait, trait]
+        covariance = (
+            omega_hat - np.outer(gamma, gamma) / tau_squared
+        )[None, :, :] + sigma_n
+        yy = gamma / tau_squared
+        rhs = np.broadcast_to(yy, (rows, traits)).copy()[:, :, None]
+        trait_weighted = np.linalg.solve(
+            np.swapaxes(covariance, 1, 2), rhs
+        )[:, :, 0]
+        weighted[trait] = trait_weighted
+        denominators[trait] = np.einsum(
+            'mp,p->m', trait_weighted, yy
+        )
+
+    return weighted, denominators
+
+
+def _mtag_analysis_repeated_n(
+    Zs,
+    Ns,
+    unique_sample_sizes,
+    inverse,
+    omega_hat,
+    sigma_LD,
+    batch_size,
+):
+    """Apply weights solved once per exact joint sample-size vector."""
+    rows, traits = Zs.shape
+    weighted, denominators = _mtag_weight_systems(
+        unique_sample_sizes, omega_hat, sigma_LD
+    )
+    mtag_betas = np.empty((rows, traits), dtype=float)
+    mtag_se = np.empty((rows, traits), dtype=float)
+    mtag_factor = np.empty((rows, traits), dtype=float)
+
+    for start in range(0, rows, batch_size):
+        stop = min(start + batch_size, rows)
+        group_ids = inverse[start:stop]
+        w_inv_z = Zs[start:stop] / np.sqrt(Ns[start:stop])
+        for trait in range(traits):
+            trait_weighted = weighted[trait, group_ids]
+            trait_denominator = denominators[trait, group_ids]
+            # Preserve the historical operation order. In particular,
+            # divide after the dot product instead of normalizing the
+            # reusable weights in advance.
+            mtag_betas[start:stop, trait] = (
+                np.einsum(
+                    'mp,mp->m', trait_weighted, w_inv_z
+                ) / trait_denominator
+            )
+            mtag_se[start:stop, trait] = np.sqrt(
+                1.0 / trait_denominator
+            )
+            mtag_factor[start:stop, trait] = np.einsum(
+                'mp,m->m', trait_weighted, 1.0 / trait_denominator
+            )
+
+    return mtag_betas, mtag_se, mtag_factor
+
+
 def mtag_analysis(Zs, Ns, omega_hat, sigma_LD, batch_size=100000):
     logging.info('Beginning MTAG calculations...')
     Zs = np.asarray(Zs, dtype=float)
@@ -1870,6 +1969,41 @@ def mtag_analysis(Zs, Ns, omega_hat, sigma_LD, batch_size=100000):
         raise ValueError(
             'MTAG covariance matrix dimensions must match the number of traits'
         )
+
+    use_repeated_n = False
+    unique_sample_sizes = None
+    inverse = None
+    if M >= 1_000 and np.all(np.isfinite(Ns)) and np.all(Ns > 0.0):
+        group_start = time.time()
+        unique_sample_sizes, inverse = _group_sample_size_rows(Ns)
+        unique_count = len(unique_sample_sizes)
+        grouped_bytes = 8 * unique_count * (P * P + P)
+        use_repeated_n = (
+            unique_count * 2 <= M
+            and grouped_bytes <= 512 * 1024 * 1024
+        )
+    if use_repeated_n:
+        logging.info(
+            'Reusing MTAG weight systems for {:,} exact sample-size '
+            'vectors across {:,} SNPs (grouping took {:.3f} seconds).'
+            .format(
+                unique_count, M, time.time() - group_start
+            )
+        )
+        results = _mtag_analysis_repeated_n(
+            Zs,
+            Ns,
+            unique_sample_sizes,
+            inverse,
+            omega_hat,
+            sigma_LD,
+            batch_size,
+        )
+        logging.info(' ... Completed MTAG calculations.')
+        return results
+
+    if unique_sample_sizes is not None:
+        del unique_sample_sizes, inverse
 
     mtag_betas = np.empty((M, P), dtype=float)
     mtag_se = np.empty((M, P), dtype=float)

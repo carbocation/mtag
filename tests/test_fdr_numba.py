@@ -829,6 +829,72 @@ def test_bordered_psd_reuse_has_conservative_boundary_fallbacks():
     assert not valid and not factor_valid and status == -1
 
 
+def test_mixed_radix_split_updates_pair_counts_incrementally():
+    parent_traits = 3
+    parent_ids = np.array([1, 3, 6], dtype=np.uint64)
+    parent_counts = np.array([2, 1, 2], dtype=np.int64)
+    split_counts = np.zeros(3, dtype=np.int64)
+    split_pair_counts = np.zeros(4, dtype=np.int64)
+    observed = 0
+
+    while True:
+        expected = np.zeros(4, dtype=np.int64)
+        for state, count in zip(parent_ids, split_counts):
+            for trait in range(parent_traits):
+                if mtag_numba._sparse_state_has_trait(
+                    state, trait, parent_traits
+                ):
+                    expected[trait] += count
+            expected[parent_traits] += count
+        np.testing.assert_array_equal(split_pair_counts, expected)
+        observed += 1
+        if not mtag_numba._advance_sparse_split_with_pair_counts(
+            split_counts,
+            parent_ids,
+            parent_counts,
+            len(parent_counts),
+            parent_traits,
+            split_pair_counts,
+        ):
+            break
+
+    assert observed == np.prod(parent_counts + 1)
+    np.testing.assert_array_equal(split_counts, np.zeros(3, dtype=int))
+    np.testing.assert_array_equal(
+        split_pair_counts, np.zeros(4, dtype=int)
+    )
+
+
+def test_reordered_pair_counts_map_to_original_trait_order():
+    trait_order = np.array([2, 0, 3, 1], dtype=np.int64)
+    reordered_ids = np.array([1, 6, 11, 15], dtype=np.uint64)
+    counts = np.array([2, 1, 3, 4], dtype=np.int64)
+    reordered_pairs = np.empty(10, dtype=np.int64)
+    original_pairs = np.empty(10, dtype=np.int64)
+    expected = np.empty(10, dtype=np.int64)
+
+    mtag_numba._seed_pair_counts(
+        reordered_ids, counts, len(counts), 4, reordered_pairs
+    )
+    mtag_numba._map_pair_counts_to_original(
+        reordered_pairs, trait_order, original_pairs
+    )
+    original_ids = np.array(
+        [
+            mtag_numba._map_sparse_state_to_original(
+                state, trait_order
+            )
+            for state in reordered_ids
+        ],
+        dtype=np.uint64,
+    )
+    mtag_numba._seed_pair_counts(
+        original_ids, counts, len(counts), 4, expected
+    )
+
+    np.testing.assert_array_equal(original_pairs, expected)
+
+
 def test_branch_search_memory_guard_is_explicit():
     traits = 4
     causal_states = mtag.create_S(traits)

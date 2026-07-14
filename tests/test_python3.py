@@ -161,6 +161,39 @@ def test_batched_mtag_analysis_matches_legacy_equations():
         )
 
 
+def test_repeated_sample_size_weights_are_bit_exact():
+    rng = np.random.default_rng(20260714)
+    unique_sample_sizes = np.array(
+        [
+            [80_000.0, 90_000.0, 100_000.0, 110_000.0],
+            [80_000.0, 90_000.0, 120_000.0, 110_000.0],
+            [95_000.0, 90_000.0, 100_000.0, 110_000.0],
+        ]
+    )
+    group_ids = np.resize(
+        np.array([2, 0, 1, 0, 2, 1, 1, 0, 2, 0, 1, 2]),
+        1_200,
+    )
+    sample_sizes = unique_sample_sizes[group_ids]
+    z_scores = rng.normal(size=sample_sizes.shape)
+    raw_omega = rng.normal(size=(4, 4))
+    omega = raw_omega @ raw_omega.T
+    omega *= 2.0e-5 / np.mean(np.diag(omega))
+    omega += np.eye(4) * 1.0e-5
+    sigma = np.full((4, 4), 0.1)
+    np.fill_diagonal(sigma, 1.0)
+
+    expected = mtag._mtag_analysis_batch(
+        z_scores, sample_sizes, omega, sigma
+    )
+    actual = mtag.mtag_analysis(
+        z_scores, sample_sizes, omega, sigma, batch_size=5
+    )
+
+    for expected_array, actual_array in zip(expected, actual):
+        np.testing.assert_array_equal(actual_array, expected_array)
+
+
 def _write_sumstats(path, z_scores, sample_size, sep=" "):
     allele_pairs = [
         ("A", "G"),

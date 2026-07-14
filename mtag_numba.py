@@ -841,6 +841,23 @@ def _seed_pair_counts(
 
 
 @njit(inline="always")
+def _map_pair_counts_to_original(
+    reordered_pair_counts, trait_order, original_pair_counts
+):
+    """Permute append-stable lower-triangle counts into trait order."""
+    num_traits = len(trait_order)
+    for reordered_high in range(num_traits):
+        original_high = trait_order[reordered_high]
+        for reordered_low in range(reordered_high + 1):
+            original_low = trait_order[reordered_low]
+            original_pair_counts[
+                _lower_pair_index(original_high, original_low)
+            ] = reordered_pair_counts[
+                _lower_pair_index(reordered_high, reordered_low)
+            ]
+
+
+@njit(inline="always")
 def _marginals_match_spike_slab_lower(
     pair_counts, intervals, num_traits, pi_causal_ss
 ):
@@ -1704,13 +1721,36 @@ def _evaluate_sparse_branch_leaves_kernel(
 
 
 @njit(inline="always")
-def _advance_sparse_split(split_counts, parent_counts, occupied):
-    """Advance a mixed-radix causal split and report whether one remains."""
+def _advance_sparse_split_with_pair_counts(
+    split_counts,
+    parent_ids,
+    parent_counts,
+    occupied,
+    parent_traits,
+    split_pair_counts,
+):
+    """Advance a split and incrementally maintain its new pair counts."""
     position = occupied - 1
     while position >= 0:
         if split_counts[position] < parent_counts[position]:
             split_counts[position] += 1
+            state = parent_ids[position]
+            for trait in range(parent_traits):
+                if _sparse_state_has_trait(
+                    state, trait, parent_traits
+                ):
+                    split_pair_counts[trait] += 1
+            split_pair_counts[parent_traits] += 1
             return True
+        previous_count = split_counts[position]
+        if previous_count:
+            state = parent_ids[position]
+            for trait in range(parent_traits):
+                if _sparse_state_has_trait(
+                    state, trait, parent_traits
+                ):
+                    split_pair_counts[trait] -= previous_count
+            split_pair_counts[parent_traits] -= previous_count
         split_counts[position] = 0
         position -= 1
     return False
@@ -1725,6 +1765,7 @@ def _build_sparse_child_from_split(
     parent_cholesky,
     parent_factor_valid,
     split_counts,
+    split_pair_counts,
     intervals,
     omega,
     prune_tolerance,
@@ -1741,17 +1782,9 @@ def _build_sparse_child_from_split(
     parent_pairs = parent_traits * (parent_traits + 1) // 2
     child_pairs = child_traits * (child_traits + 1) // 2
     child_pair_counts[:parent_pairs] = parent_pair_counts[:parent_pairs]
-    child_pair_counts[parent_pairs:child_pairs] = 0
-
-    for occupied_index in range(parent_occupied):
-        causal_count = split_counts[occupied_index]
-        if causal_count == 0:
-            continue
-        state = parent_ids[occupied_index]
-        for trait in range(parent_traits):
-            if _sparse_state_has_trait(state, trait, parent_traits):
-                child_pair_counts[parent_pairs + trait] += causal_count
-        child_pair_counts[parent_pairs + parent_traits] += causal_count
+    child_pair_counts[parent_pairs:child_pairs] = (
+        split_pair_counts[:child_traits]
+    )
 
     for pair_number in range(parent_pairs, child_pairs):
         if child_pair_counts[pair_number] == 0:
@@ -1815,6 +1848,7 @@ def _load_pair_signature_cache(
     pair_counts,
     intervals,
     omega,
+    known_psd,
     cache_hashes,
     cache_generations,
     cache_valid,
@@ -1848,21 +1882,23 @@ def _load_pair_signature_cache(
     _build_scaled_omega_lower(
         pair_counts[:num_pairs], intervals, omega, scaled_omega
     )
-    psd_status = _fast_psd_status(scaled_omega)
-    psd_valid = psd_status >= 0
-    if psd_status == 0:
-        eigenvalues = np.linalg.eigvalsh(scaled_omega)
-        max_abs_eigenvalue = 1.0
-        for eigenvalue in eigenvalues:
-            max_abs_eigenvalue = max(
-                max_abs_eigenvalue, abs(eigenvalue)
+    psd_valid = known_psd
+    if not known_psd:
+        psd_status = _fast_psd_status(scaled_omega)
+        psd_valid = psd_status >= 0
+        if psd_status == 0:
+            eigenvalues = np.linalg.eigvalsh(scaled_omega)
+            max_abs_eigenvalue = 1.0
+            for eigenvalue in eigenvalues:
+                max_abs_eigenvalue = max(
+                    max_abs_eigenvalue, abs(eigenvalue)
+                )
+            tolerance = (
+                np.finfo(np.float64).eps
+                * max_abs_eigenvalue
+                * num_traits
             )
-        tolerance = (
-            np.finfo(np.float64).eps
-            * max_abs_eigenvalue
-            * num_traits
-        )
-        psd_valid = eigenvalues[0] >= -tolerance
+            psd_valid = eigenvalues[0] >= -tolerance
 
     cache_generations[slot] += 1
     cache_hashes[slot] = signature_hash
@@ -1970,6 +2006,8 @@ def _evaluate_one_streamed_leaf(
     reordered_ids,
     reordered_counts,
     occupied,
+    reordered_pair_counts,
+    factor_valid,
     trait_order,
     intervals,
     omega,
@@ -2012,11 +2050,9 @@ def _evaluate_one_streamed_leaf(
         )
         original_counts[occupied_index] = reordered_counts[occupied_index]
     _sort_sparse_state_counts(original_ids, original_counts, occupied)
-    _seed_pair_counts(
-        original_ids,
-        original_counts,
-        occupied,
-        num_traits,
+    _map_pair_counts_to_original(
+        reordered_pair_counts,
+        trait_order,
         original_pair_counts,
     )
     if fit_ss and not _marginals_match_spike_slab_lower(
@@ -2037,6 +2073,7 @@ def _evaluate_one_streamed_leaf(
         original_pair_counts[:num_pairs],
         intervals,
         omega,
+        factor_valid,
         pair_cache_hashes,
         pair_cache_generations,
         pair_cache_valid,
@@ -2144,6 +2181,9 @@ def _depth_first_sparse_branch_kernel(
     split_counts = np.zeros(
         (num_traits + 1, intervals), dtype=np.int64
     )
+    split_pair_counts = np.zeros(
+        (num_traits + 1, num_traits), dtype=np.int64
+    )
     # 0 = uninitialized, 1 = another split is ready, and 2 = the split
     # just descended into was the last one at this depth.  Keeping the
     # exhausted state distinct prevents a return from a child from
@@ -2230,6 +2270,8 @@ def _depth_first_sparse_branch_kernel(
                     stack_ids[depth],
                     stack_counts[depth],
                     stack_occupied[depth],
+                    stack_pairs[depth],
+                    stack_factor_valid[depth] != 0,
                     trait_order,
                     intervals,
                     omega,
@@ -2312,6 +2354,7 @@ def _depth_first_sparse_branch_kernel(
                 continue
             if split_state[depth] == 0:
                 split_counts[depth] = 0
+                split_pair_counts[depth] = 0
                 split_state[depth] = 1
 
             level_visited[depth] += 1
@@ -2326,6 +2369,7 @@ def _depth_first_sparse_branch_kernel(
                     stack_cholesky[depth, :depth, :depth],
                     stack_factor_valid[depth] != 0,
                     split_counts[depth],
+                    split_pair_counts[depth],
                     intervals,
                     child_omega,
                     prune_tolerance,
@@ -2339,10 +2383,13 @@ def _depth_first_sparse_branch_kernel(
                     ],
                 )
             )
-            has_next = _advance_sparse_split(
+            has_next = _advance_sparse_split_with_pair_counts(
                 split_counts[depth],
+                stack_ids[depth],
                 stack_counts[depth],
                 stack_occupied[depth],
+                depth,
+                split_pair_counts[depth],
             )
             if not has_next:
                 split_state[depth] = 2
