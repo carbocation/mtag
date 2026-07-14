@@ -80,6 +80,42 @@ def test_probability_grid_loader_accepts_one_row_and_excludes_invalid_rows(
         mtag.load_probability_grid(wrong_width, 4)
 
 
+def test_automatic_probability_grid_is_filtered_while_streaming(
+    tmp_path, monkeypatch
+):
+    state = {"yielded": None, "filtered": None}
+    points = [
+        np.array([0.0, 0.5, 0.0, 0.5]),
+        np.array([0.5, 0.0, 0.0, 0.5]),
+    ]
+
+    def tracked_grid(*args):
+        for index, point in enumerate(points):
+            if index:
+                assert state["filtered"] == index - 1
+            state["yielded"] = index
+            yield point
+
+    def tracked_filter(probability, causal_states):
+        state["filtered"] = state["yielded"]
+        return True
+
+    monkeypatch.setattr(mtag, "simplex_walk", tracked_grid)
+    monkeypatch.setattr(mtag, "some_causal_for_allT", tracked_filter)
+    monkeypatch.setattr(mtag, "is_pos_semidef", lambda matrix: True)
+    monkeypatch.setattr(mtag, "compute_fdr", lambda *args: 0.25)
+
+    fdr_matrix, probability_grid = mtag.fdr(
+        _fdr_args(tmp_path / "streaming"),
+        np.array([[10_000.0, 12_000.0]]),
+        np.zeros((1, 2)),
+    )
+
+    assert state["filtered"] == len(points) - 1
+    np.testing.assert_allclose(probability_grid, points)
+    np.testing.assert_allclose(fdr_matrix, 0.25)
+
+
 def test_exact_sample_sizes_and_fitted_spike_slab_paths(tmp_path):
     sample_sizes = np.array(
         [

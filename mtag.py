@@ -1280,9 +1280,7 @@ def fdr(args, Ns_f, Zs):
     else:
         # automate the creation of the probability grid
         # one_dim_interval = np.linspace(0., 1., args.intervals +1)
-        prob_grid = np.asarray(
-            list(simplex_walk(len(S)-1, args.intervals+1)), dtype=float
-        )
+        prob_grid = simplex_walk(len(S)-1, args.intervals+1)
     # exclude probabilities that have at least one trait with zero pi_causal
     # exclude probabilities that don't yield a valid NPD matrix
     prob_grid = [x for x in prob_grid if some_causal_for_allT(x,S) and is_pos_semidef(scale_omega(args.omega_hat, x,S))]
