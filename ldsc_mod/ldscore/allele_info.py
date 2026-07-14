@@ -1,4 +1,5 @@
 import itertools as it
+from functools import reduce
 '''
 Contains useful objects related to allele relationships for ../munge_sumstats/py and sumstats.py
 
@@ -60,4 +61,3 @@ def sec_to_str(t):
 
     f += '{S}s'.format(S=s)
     return f
-

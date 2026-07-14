@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 '''
 '''
 
@@ -21,6 +21,7 @@ from ldsc_mod.ldscore import allele_info
 
 import mtag_munge as munge_sumstats
 import warnings
+from functools import reduce
 warnings.filterwarnings("ignore")
 
 __version__ = '1.0.8'
@@ -44,7 +45,7 @@ header += "\n\n"
 
 pd.set_option('display.max_rows', 500)
 pd.set_option('display.width', 800)
-pd.set_option('precision', 12)
+pd.set_option('display.precision', 12)
 pd.set_option('max_colwidth', 800)
 pd.set_option('colheader_justify', 'left')
 
@@ -86,7 +87,7 @@ def _read_GWAS_sumstats(GWAS_file_name, chunksize):
     '''
     # TODO read more file types
     (openfunc, compression) = munge_sumstats.get_compression(GWAS_file_name)
-    dat_gen = pd.read_csv(GWAS_file_name, index_col=False, header=0,delim_whitespace=True, compression=compression, na_values=['.','NA'],
+    dat_gen = pd.read_csv(GWAS_file_name, index_col=False, header=0, sep=r'\s+', compression=compression, na_values=['.','NA'],
         iterator=True, chunksize=chunksize)
     dat_gen = list(dat_gen)
     dat_gen_unfiltered = pd.concat(dat_gen, axis=0).reset_index(drop=True)
@@ -360,7 +361,7 @@ def load_and_merge_data(args):
                 GWAS_int.loc[snps_to_flip, 'A2'+str(p)] = store_allele
                 logging.info('Flipped the signs of of {} SNPs to make them consistent with the effect allele orderings of the first trait.'.format(np.sum(snps_to_flip)))
 
-        STRAND_AMBIGUOUS_SET = [x for x in allele_info.STRAND_AMBIGUOUS.keys() if allele_info.STRAND_AMBIGUOUS[x]]
+        STRAND_AMBIGUOUS_SET = [x for x in allele_info.STRAND_AMBIGUOUS if allele_info.STRAND_AMBIGUOUS[x]]
 
         GWAS_int['strand_ambig'] = (GWAS_int['A1'+str(0)].str.upper() + GWAS_int['A2'+str(0)].str.upper()).isin(STRAND_AMBIGUOUS_SET)
 
@@ -451,7 +452,7 @@ def estimate_sigma(data_df, args):
             ld_ss_name['BETA' + str(p)] = 'BETA'
             ld_ss_name['SE' + str(p)] = 'SE'
 
-        gwas_ss_df[p] = data_df[ld_ss_name.keys()].copy()
+        gwas_ss_df[p] = data_df[list(ld_ss_name)].copy()
         gwas_ss_df[p] = gwas_ss_df[p].rename(columns=ld_ss_name)
 
     # run ldsc
@@ -527,7 +528,7 @@ def extract_gwas_sumstats(DATA, args, t0):
     Fs: matrix of allele frequencies
     '''
     n_cols = ['N' +str(p) for p in t0]
-    Ns = DATA.filter(items=n_cols).as_matrix()
+    Ns = DATA.filter(items=n_cols).to_numpy()
 
     # Apply sample-size specific filters
 
@@ -579,13 +580,13 @@ def extract_gwas_sumstats(DATA, args, t0):
     DATA = DATA[N_passFilter].reset_index()
     N_raw = np.copy(Ns)
     f_cols = ['FRQ'+ str(p) for p in t0]
-    Fs = DATA.filter(items=f_cols).as_matrix()
+    Fs = DATA.filter(items=f_cols).to_numpy()
 
     if args.use_beta_se:
         beta_cols = ['BETA'+str(p) for p in t0]
         se_cols = ['SE'+str(p) for p in t0]
-        BETAs = DATA.filter(items=beta_cols).as_matrix()
-        SEs = DATA.filter(items=se_cols).as_matrix()
+        BETAs = DATA.filter(items=beta_cols).to_numpy()
+        SEs = DATA.filter(items=se_cols).to_numpy()
 
         # standardizing factor
         std_factor = np.sqrt(2*Fs*(1-Fs))
@@ -594,7 +595,7 @@ def extract_gwas_sumstats(DATA, args, t0):
         Ns = 1 / np.square(SEs)
     else:
         z_cols = ['Z'+str(p) for p in t0]
-        Zs = DATA.filter(items=z_cols).as_matrix()
+        Zs = DATA.filter(items=z_cols).to_numpy()
 
     assert Zs.shape[1] == Ns.shape[1] == Fs.shape[1]
 
@@ -928,7 +929,7 @@ def write_summary(args,Zs,Ns,Fs,mtag_betas,mtag_se,mtag_factor):
         summary_df.loc[p+1, '# SNPs used'] = int(len(Zs[:,p]))
 
         if args.meta_format:
-            comb_df_extract = [Ns[y][x] for y in Ns.keys() for x in Ns[y].keys() if x==p]
+            comb_df_extract = [Ns[y][x] for y in Ns for x in Ns[y] if x==p]
             out_df = pd.concat(comb_df_extract, axis=0)
             summary_df.loc[p+1, 'N (max)'] = np.max(out_df[args.n_name])
             summary_df.loc[p+1, 'N (mean)'] = np.mean(out_df[args.n_name])
@@ -963,7 +964,7 @@ def save_mtag_results_U(args, comb_df):
     '''    
     for p in range(args.P):
         logging.info('Writing Phenotype {} to file...'.format(p+1))
-        comb_df_extract = [comb_df[y][x] for y in comb_df.keys() for x in comb_df[y].keys() if x==p]
+        comb_df_extract = [comb_df[y][x] for y in comb_df for x in comb_df[y] if x==p]
         out_df = pd.concat(comb_df_extract, axis=0)
         M_0 = out_df.shape[0]
 
@@ -1015,17 +1016,12 @@ def simplex_walk(num_dims, samples_per_dim):
     """
     A generator that returns lattice points on an n-simplex.
     """
-    try:
-        from itertools import izip
-    except:
-        izip = zip
-
     max_ = samples_per_dim + num_dims - 1
     for c in itertools.combinations(range(max_), num_dims):
         #logging.info(c)
         c = list(c)
         yield np.array([(y - x - 1.) / (samples_per_dim - 1.)
-               for x, y in izip([-1] + c, c + [max_])])
+               for x, y in zip([-1] + c, c + [max_])])
 
 def scale_omega(gen_corr_mat, priors, S=None):
     assert gen_corr_mat.shape[0] == gen_corr_mat.shape[1]
@@ -1300,7 +1296,7 @@ def mtag(args):
     header_sub += "Calling ./mtag.py \\\n"
     defaults = vars(parser.parse_args(''))
     opts = vars(args)
-    non_defaults = [x for x in opts.keys() if opts[x] != defaults[x]]
+    non_defaults = [x for x in opts if opts[x] != defaults[x]]
     options = ['--'+x.replace('_','-')+' '+str(opts[x])+' \\' for x in non_defaults]
     header_sub += '\n'.join(options).replace('True','').replace('False','')
     header_sub = header_sub[0:-1] + '\n'
@@ -1395,7 +1391,7 @@ def mtag(args):
         combo_dict = dict()
 
         # Loop over subtypes of SNPs
-        comb_df = dict.fromkeys(sub_dict.keys())
+        comb_df = dict.fromkeys(sub_dict)
 
         for s in range(len(sub_dict)):
             t = np.sum(list(sub_dict.keys())[s])
@@ -1444,7 +1440,7 @@ def mtag(args):
                 comb_df[sub_list[s][0]][t]['mtag_pval'] = p_values(comb_df[sub_list[s][0]][t]['mtag_z'])
 
         # check all elements sum to union SNPs
-        comb_flat = [list(comb_df[y].values())[0] for y in comb_df.keys()]
+        comb_flat = [list(comb_df[y].values())[0] for y in comb_df]
         assert DATA_U.shape[0] == np.sum(np.asarray([x.shape[0] for x in comb_flat]))
 
     mtag_betas, mtag_se, mtag_factor = mtag_analysis(Zs, Ns, args.omega_hat, args.sigma_hat)
@@ -1493,7 +1489,7 @@ input_formatting.add_argument('--p_name',default='p', type=str, help="Name of th
 filter_opts = parser.add_argument_group(title="Filter Options", description="The input summary statistics files can be filtered using the options below. Note that there is some default filtering according to sample size and allele frequency, following the recommendations we make in the corresponding paper. All of these column-based options allow a list of values to be passed of the same length as the number of traits ")
 filter_opts.add_argument("--include",default=None, metavar="SNPLIST1,SNPLIST2,..", type=str, help="Restricts MTAG analysis to the union of snps in the list of  snplists provided. The header line must match the SNP index that will be used to merge the GWAS input files.")
 filter_opts.add_argument("--exclude", "--excludeSNPs",default=None, metavar="SNPLIST1,SNPLIST2,..", type=str, help="Similar to the --include option, except that the union of SNPs found in the specified files will be excluded from MTAG. Both -exclude and -include may be simultaneously specified, but -exclude will take precedent (i.e., SNPs found in both the -include and -exclude SNP lists will be excluded).")
-filter_opts.add_argument('--only_chr', metavar="CHR_A,CHR_B,..", default=None, type=str, action="store", help="Restrict MTAG to SNPs on one of the listed, comma-separated chromosome. Can be specified simultaneously with --include and --exclude, but will take precedent over both. Not generally recommended. Multiple chromosome numbers should be separated by commas without whitespace. If this option is specified, the GWAS summary statistics must also list the chromosome of each SNPs in a column named \`chr\`.")
+filter_opts.add_argument('--only_chr', metavar="CHR_A,CHR_B,..", default=None, type=str, action="store", help="Restrict MTAG to SNPs on one of the listed, comma-separated chromosome. Can be specified simultaneously with --include and --exclude, but will take precedent over both. Not generally recommended. Multiple chromosome numbers should be separated by commas without whitespace. If this option is specified, the GWAS summary statistics must also list the chromosome of each SNPs in a column named `chr`.")
 filter_opts.add_argument("--homogNs_frac", default=None, type=str, action="store", metavar="FRAC", help="Restricts to SNPs within FRAC of the mode of sample sizes for the SNPs as given by (N-Mode)/Mode < FRAC. This filter is not applied by default.")
 filter_opts.add_argument("--homogNs_dist", default=None, type=str, action="store", metavar="D", help="Restricts to SNPs within DIST (in sample size) of the mode of sample sizes for the SNPs. This filter is not applied by default.")
 filter_opts.add_argument('--maf_min', default='0.01', type=str, action='store', help="set the threshold below SNPs with low minor allele frequencies will be dropped. Default is 0.01. Set to 0 to skip MAF filtering.")
@@ -1559,7 +1555,7 @@ if __name__ == '__main__':
 
         # extract Ns and Zs
         for t in range(T):
-            df_d[t] = pd.read_csv('{}_trait_{}.txt'.format(args.out, t+1), index_col=None, delim_whitespace=True)
+            df_d[t] = pd.read_csv('{}_trait_{}.txt'.format(args.out, t+1), index_col=None, sep=r'\s+')
             if t == 0:
                 N_mat = np.empty((len(df_d[t]), T))
                 Z_mat = np.empty((len(df_d[t]), T))

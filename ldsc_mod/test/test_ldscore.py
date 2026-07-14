@@ -1,9 +1,13 @@
-import ldscore.ldscore as ld
+import ldsc_mod.ldscore.ldscore as ld
 import unittest
 import bitarray as ba
 import numpy as np
-import nose
-import ldscore.parse as ps
+import pytest
+from pathlib import Path
+import ldsc_mod.ldscore.parse as ps
+
+TEST_DIR = Path(__file__).parent
+PLINK_FIXTURES_PRESENT = (TEST_DIR / 'plink_test/plink.bed').exists()
 
 
 def test_getBlockLefts():
@@ -27,6 +31,7 @@ def test_block_left_to_right():
         assert np.all(block_right == correct_answer)
 
 
+@unittest.skipUnless(PLINK_FIXTURES_PRESENT, 'PLINK binary fixtures are not distributed')
 class test_bed(unittest.TestCase):
 
     def setUp(self):
@@ -37,16 +42,16 @@ class test_bed(unittest.TestCase):
     def test_bed(self):
         bed = ld.PlinkBEDFile('test/plink_test/plink.bed', self.N, self.bim)
         # remove three monomorphic SNPs
-        print bed.geno
-        print bed.m
+        print(bed.geno)
+        print(bed.m)
         assert bed.m == 4
         # no individuals removed
-        print bed.n
+        print(bed.n)
         assert self.N == bed.n
         # 5 indivs * 4 polymorphic SNPs
-        print len(bed.geno)
+        print(len(bed.geno))
         assert len(bed.geno) == 64
-        print bed.freq
+        print(bed.freq)
         correct = np.array(
             [0.59999999999999998, 0.59999999999999998, 0.625, 0.625])
         assert np.all(bed.freq == correct)
@@ -77,22 +82,22 @@ class test_bed(unittest.TestCase):
                               keep_snps=keep_snps, keep_indivs=keep_indivs)
         assert bed.m == 1
         assert bed.n == 2
-        print bed.geno
+        print(bed.geno)
         assert bed.geno[0:4] == ba.bitarray('0001')
 
-    @nose.tools.raises(ValueError)
     def test_bad_filename(self):
-        bed = ld.PlinkBEDFile('test/plink_test/plink.bim', 9, self.bim)
+        with pytest.raises(ValueError):
+            ld.PlinkBEDFile('test/plink_test/plink.bim', 9, self.bim)
 
-    @nose.tools.raises(ValueError)
     def test_nextSNPs_errors1(self):
         bed = ld.PlinkBEDFile('test/plink_test/plink.bed', self.N, self.bim)
-        bed.nextSNPs(0)
+        with pytest.raises(ValueError):
+            bed.nextSNPs(0)
 
-    @nose.tools.raises(ValueError)
     def test_nextSNPs_errors2(self):
         bed = ld.PlinkBEDFile('test/plink_test/plink.bed', self.N, self.bim)
-        bed.nextSNPs(5)
+        with pytest.raises(ValueError):
+            bed.nextSNPs(5)
 
     def test_nextSNPs(self):
         for b in [1, 2, 3]:

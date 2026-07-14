@@ -1,14 +1,19 @@
 from __future__ import division
-from ldscore import parse as ps
+from ldsc_mod.ldscore import parse as ps
 import unittest
 import numpy as np
 import pandas as pd
-import nose
 import os
-from nose.tools import *
-from numpy.testing import assert_array_equal, assert_array_almost_equal
+import pytest
+from pathlib import Path
+from numpy.testing import assert_array_equal, assert_array_almost_equal, assert_equal
 
-DIR = os.path.dirname(__file__)
+DIR = Path(__file__).parent
+assert_raises = pytest.raises
+HAS_TEXT_PARSE_FIXTURES = (DIR / 'parse_test/test.cts').exists()
+HAS_SINGLE_LDSCORE_FIXTURE = (DIR / 'parse_test/test.l2.ldscore.bz2').exists()
+HAS_M_FIXTURES = (DIR / 'parse_test/test.l2.M').exists()
+HAS_PLINK_FIXTURES = (DIR / 'plink_test/plink.bim').exists()
 
 
 def test_series_eq():
@@ -26,6 +31,7 @@ def test_get_compression():
     assert_equal(ps.get_compression('asdf'), None)
 
 
+@pytest.mark.skipif(not HAS_TEXT_PARSE_FIXTURES, reason='legacy text parsing fixtures are not distributed')
 def test_read_cts():
     match_snps = pd.Series(['rs1', 'rs2', 'rs3'])
     assert_array_equal(
@@ -34,6 +40,7 @@ def test_read_cts():
         DIR, 'parse_test/test.cts'), match_snps[0:2])
 
 
+@pytest.mark.skipif(not HAS_TEXT_PARSE_FIXTURES, reason='legacy text parsing fixtures are not distributed')
 def test_read_sumstats():
     x = ps.sumstats(
         os.path.join(DIR, 'parse_test/test.sumstats'), dropna=True, alleles=True)
@@ -43,6 +50,7 @@ def test_read_sumstats():
         DIR, 'parse_test/test.l2.ldscore.gz'))
 
 
+@pytest.mark.skipif(not HAS_TEXT_PARSE_FIXTURES, reason='legacy frequency fixtures are not distributed')
 def test_frq_parser():
     x = ps.frq_parser(os.path.join(DIR, 'parse_test/test1.frq'), compression=None)
     assert_array_equal(x.columns, ['SNP', 'FRQ'])
@@ -57,28 +65,33 @@ def test_frq_parser():
 class Test_ldscore(unittest.TestCase):
 
     def test_ldscore(self):
+        if not HAS_SINGLE_LDSCORE_FIXTURE:
+            self.skipTest('single-file LD Score fixture is not distributed')
         x = ps.ldscore(os.path.join(DIR, 'parse_test/test'))
         assert_equal(list(x['SNP']), ['rs' + str(i) for i in range(1, 23)])
-        assert_equal(list(x['AL2']), range(1, 23))
-        assert_equal(list(x['BL2']), range(2, 46, 2))
+        assert_equal(list(x['AL2']), list(range(1, 23)))
+        assert_equal(list(x['BL2']), list(range(2, 46, 2)))
 
     def test_ldscore_loop(self):
         x = ps.ldscore(os.path.join(DIR, 'parse_test/test'), 2)
         assert_equal(list(x['SNP']), ['rs' + str(i) for i in range(1, 3)])
-        assert_equal(list(x['AL2']), range(1, 3))
-        assert_equal(list(x['BL2']), range(2, 6, 2))
+        assert_equal(list(x['AL2']), list(range(1, 3)))
+        assert_equal(list(x['BL2']), list(range(2, 6, 2)))
 
     def test_ldscore_fromlist(self):
+        if not HAS_SINGLE_LDSCORE_FIXTURE:
+            self.skipTest('single-file LD Score fixture is not distributed')
         fh = os.path.join(DIR, 'parse_test/test')
         x = ps.ldscore_fromlist([fh, fh])
         assert_array_equal(x.shape, (22, 5))
         y = ps.ldscore(os.path.join(DIR, 'parse_test/test'))
-        assert_array_equal(x.ix[:, 0:3], y)
-        assert_array_equal(x.ix[:, [0, 3, 4]], y)
+        assert_array_equal(x.iloc[:, 0:3], y)
+        assert_array_equal(x.iloc[:, [0, 3, 4]], y)
         assert_raises(
             ValueError, ps.ldscore_fromlist, [fh, os.path.join(DIR, 'parse_test/test2')])
 
 
+@unittest.skipUnless(HAS_M_FIXTURES, 'LD Score M fixtures are not distributed')
 class Test_M(unittest.TestCase):
 
     def test_bad_M(self):
@@ -102,6 +115,7 @@ class Test_M(unittest.TestCase):
         assert_array_equal(x, np.hstack((ps.M(fh), ps.M(fh))))
 
 
+@unittest.skipUnless(HAS_PLINK_FIXTURES, 'PLINK fixtures are not distributed')
 class Test_Fam(unittest.TestCase):
 
     def test_fam(self):
@@ -115,6 +129,7 @@ class Test_Fam(unittest.TestCase):
             ValueError, ps.PlinkFAMFile, os.path.join(DIR, 'plink_test/plink.bim'))
 
 
+@unittest.skipUnless(HAS_PLINK_FIXTURES, 'PLINK fixtures are not distributed')
 class Test_Bim(unittest.TestCase):
 
     def test_bim(self):

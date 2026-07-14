@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 from __future__ import division
 from __future__ import absolute_import
 from ldsc_mod.ldscore import allele_info as allele_info
@@ -391,7 +391,7 @@ def parse_dat(dat_gen, convert_colname, merge_alleles, args):
         #dat = dat.dropna(axis=0, how="any", subset=filter(
         #    lambda x: x != 'INFO', dat.columns)).reset_index(drop=True)
         drops['NA'] += old - len(dat)
-        dat.columns = map(lambda x: convert_colname[x], dat.columns)
+        dat.columns = [convert_colname[x] for x in dat.columns]
         ii = np.array([True for i in range(len(dat))])
         if args.merge_alleles:
             old = ii.sum()
@@ -714,7 +714,7 @@ def munge_sumstats(args, write_out=True, new_log=True):
         if write_out:
             defaults = vars(parser.parse_args(''))
             opts = vars(args)
-            non_defaults = [x for x in opts.keys() if opts[x] != defaults[x]]
+            non_defaults = [x for x in opts if opts[x] != defaults[x]]
             header = allele_info.MASTHEAD
             header += "Call: \n"
             header += './munge_sumstats.py \\\n'
@@ -740,8 +740,8 @@ def munge_sumstats(args, write_out=True, new_log=True):
         cname_map = get_cname_map(
             flag_cnames, mod_default_cnames, ignore_cnames)
         if args.daner:
-            frq_u = filter(lambda x: x.startswith('FRQ_U_'), file_cnames)[0]
-            frq_a = filter(lambda x: x.startswith('FRQ_A_'), file_cnames)[0]
+            frq_u = next(x for x in file_cnames if x.startswith('FRQ_U_'))
+            frq_a = next(x for x in file_cnames if x.startswith('FRQ_A_'))
             N_cas = float(frq_a[6:])
             N_con = float(frq_u[6:])
             logging.info(
@@ -756,7 +756,7 @@ def munge_sumstats(args, write_out=True, new_log=True):
             cname_map[frq_u] = 'FRQ'
 
         if args.daner_n:
-            frq_u = filter(lambda x: x.startswith('FRQ_U_'), file_cnames)[0]
+            frq_u = next(x for x in file_cnames if x.startswith('FRQ_U_'))
             cname_map[frq_u] = 'FRQ'
             try:
                 dan_cas = clean_header(file_cnames[file_cnames.index('Nca')])
@@ -808,7 +808,7 @@ def munge_sumstats(args, write_out=True, new_log=True):
                 raise ValueError('Found {num} columns named {C}'.format(C=field,num=str(numk)))
 
         # check multiple different column names don't map to same data field
-        for head in cname_translation.values():
+        for head in list(cname_translation.values()):
             numc = list(cname_translation.values()).count(head)
             if numc > 1:
                 raise ValueError('Found {num} different {C} columns'.format(C=head,num=str(numc)))
@@ -834,7 +834,7 @@ def munge_sumstats(args, write_out=True, new_log=True):
                 'Reading list of SNPs for allele merge from {F}'.format(F=args.merge_alleles))
             (openfunc, compression) = get_compression(args.merge_alleles)
             merge_alleles = pd.read_csv(args.merge_alleles, compression=compression, header=0,
-                                        delim_whitespace=True, na_values='.')
+                                        sep=r'\s+', na_values='.')
             if any(x not in merge_alleles.columns for x in ["SNP", "A1", "A2"]):
                 raise ValueError(
                     '--merge-alleles must have columns SNP, A1, A2.')
@@ -856,8 +856,8 @@ def munge_sumstats(args, write_out=True, new_log=True):
 
         else:
             (openfunc, compression) = get_compression(args.sumstats)
-            dat_gen = pd.read_csv(args.sumstats, delim_whitespace=True, header=0,
-                compression=compression, usecols=cname_translation.keys(),
+            dat_gen = pd.read_csv(args.sumstats, sep=r'\s+', header=0,
+                compression=compression, usecols=list(cname_translation.keys()),
                 na_values=['.', 'NA','NaN'], iterator=True, chunksize=args.chunksize,
                 dtype={c:np.float64 for c in signed_sumstat_cols})
             dat_gen = list(dat_gen)

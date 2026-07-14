@@ -5,7 +5,7 @@
 
 ## Getting Started
 
-First, you will need to install python as well as the packages listed under the requirements header below. The easiest way to do this is with the [Anaconda](https://store.continuum.io/cshop/anaconda/) python distribution. All of the required packages come standard with Ananconda (Broad users: do `use Anaconda`).
+This vendored LDSC copy runs on Python 3.10 or newer. Install the repository's root `requirements.txt` before using it.
 
 In order to download `ldsc`, you should clone this repository via the command
 ```  
@@ -13,8 +13,8 @@ git clone https://github.com/bulik/ldsc.git
 ```
 Once you have installed `ldsc` as well as the required packages, typing
 ```
-./ldsc.py -h
-./munge_sumstats.py -h
+python -m ldsc_mod.ldsc -h
+python -m ldsc_mod.munge_sumstats -h
 ```
 will print a list of all command-line options. If these commands fail with an error, then something as gone wrong during the installation process. 
 
@@ -90,16 +90,13 @@ https://doi.org/10.1093/bioinformatics/btw613
 
 ##Requirements
 
-1. `Python (3 > version >= 2.7)`
-2. `argparse`
-3. `bitarray`
-4. `numpy`
-5. `pandas`
-6. `scipy`
+1. `Python >= 3.10`
+2. `bitarray >= 2.8`
+3. `numpy >= 1.26`
+4. `pandas >= 2.2`
+5. `scipy >= 1.11`
 
-The python data science stack is still under constant development, with frequent breaking changes. We will attempt to keep `ldsc` compatible with the newest releases of `numpy/scipy/pandas`, and we therefore recommend that you make sure you are running the latest versions of these three packages. This is most easily accomplished using the [`Anaconda`]((https://store.continuum.io/cshop/anaconda/) ) python distribution and the included package manager `conda`.  
-
-`ldsc` is not presently compatible with python 3.x.
+The tested dependency ranges are recorded in the repository's root `requirements.txt` and `environment.yml` files.
 
 ##License
 

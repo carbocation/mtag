@@ -17,7 +17,7 @@ def series_eq(x, y):
 
 
 def read_csv(fh, **kwargs):
-    return pd.read_csv(fh, delim_whitespace=True, na_values='.', **kwargs)
+    return pd.read_csv(fh, sep=r'\s+', na_values='.', **kwargs)
 
 
 def sub_chr(s, chr):
@@ -135,7 +135,7 @@ def ldscore(fh, num=None):
     if num is not None:  # num files, e.g., one per chromosome
         first_fh = sub_chr(fh, 1) + suffix
         s, compression = which_compression(first_fh)
-        chr_ld = [l2_parser(sub_chr(fh, i) + suffix + s, compression) for i in xrange(1, num + 1)]
+        chr_ld = [l2_parser(sub_chr(fh, i) + suffix + s, compression) for i in range(1, num + 1)]
         x = pd.concat(chr_ld)  # automatically sorted by chromosome
     else:  # just one file
         s, compression = which_compression(fh + suffix)
@@ -148,13 +148,16 @@ def ldscore(fh, num=None):
 
 def M(fh, num=None, N=2, common=False):
     '''Parses .l{N}.M files, split across num chromosomes. See docs/file_formats_ld.txt.'''
-    parsefunc = lambda y: [float(z) for z in open(y, 'r').readline().split()]
+    def parsefunc(path):
+        with open(path, 'r') as handle:
+            return [float(value) for value in handle.readline().split()]
+
     suffix = '.l' + str(N) + '.M'
     if common:
         suffix += '_5_50'
 
     if num is not None:
-        x = np.sum([parsefunc(sub_chr(fh, i) + suffix) for i in xrange(1, num + 1)], axis=0)
+        x = np.sum([parsefunc(sub_chr(fh, i) + suffix) for i in range(1, num + 1)], axis=0)
     else:
         x = parsefunc(fh + suffix)
 
@@ -190,7 +193,7 @@ def annot(fh_list, num=None, frqfile=None):
 
         y = []
         M_tot = 0
-        for chr in xrange(1, num + 1):
+        for chr in range(1, num + 1):
             if frqfile is not None:
                 df_annot_chr_list = [annot_parser(sub_chr(fh, chr) + annot_suffix[i], annot_compression[i],
                                                   sub_chr(frqfile, chr) + frq_suffix, frq_compression)
@@ -251,7 +254,7 @@ def __ID_List_Factory__(colnames, keepcol, fname_end, header=None, usecols=None)
 
             comp = get_compression(fname)
             self.df = pd.read_csv(fname, header=self.__header__, usecols=self.__usecols__,
-                                  delim_whitespace=True, compression=comp)
+                                  sep=r'\s+', compression=comp)
 
             if self.__colnames__:
                 self.df.columns = self.__colnames__

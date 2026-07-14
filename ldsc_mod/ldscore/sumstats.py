@@ -71,7 +71,7 @@ def smart_merge(x, y):
     '''Check if SNP columns are equal. If so, save time by using concat instead of merge.'''
     if len(x) == len(y) and (x.index == y.index).all() and (x.SNP == y.SNP).all():
         x = x.reset_index(drop=True)
-        y = y.reset_index(drop=True).drop('SNP', 1)
+        y = y.reset_index(drop=True).drop(columns='SNP')
         out = pd.concat([x, y], axis=1)
     else:
         out = pd.merge(x, y, how='inner', on='SNP')
@@ -191,14 +191,14 @@ def _check_ld_condnum(args, log, ref_ld):
 
 def _check_variance(log, M_annot, ref_ld):
     '''Remove zero-variance LD Scores.'''
-    ii = ref_ld.ix[:, 1:].var() == 0  # NB there is a SNP column here
+    ii = ref_ld.iloc[:, 1:].var() == 0  # NB there is a SNP column here
     if ii.all():
         raise ValueError('All LD Scores have zero variance.')
     else:
         log.log('Removing partitioned LD Scores with zero variance.')
         ii_snp = np.array([True] + list(~ii))
         ii_m = np.array(~ii)
-        ref_ld = ref_ld.ix[:, ii_snp]
+        ref_ld = ref_ld.iloc[:, ii_snp]
         M_annot = M_annot[:, ii_m]
 
     return M_annot, ref_ld, ii
@@ -275,7 +275,7 @@ def cell_type_specific(args, log):
         chisq_max = args.chisq_max
 
     ii = np.ravel(sumstats.Z**2 < chisq_max)
-    sumstats = sumstats.ix[ii, :]
+    sumstats = sumstats.loc[ii, :]
     log.log('Removed {M} SNPs with chi^2 > {C} ({N} SNPs remain)'.format(
             C=chisq_max, N=np.sum(ii), M=n_snp-np.sum(ii)))
     n_snp = np.sum(ii)  # lambdas are late-binding, so this works
@@ -286,11 +286,13 @@ def cell_type_specific(args, log):
     s = lambda x: np.array(x).reshape((n_snp, 1))
     results_columns = ['Name', 'Coefficient', 'Coefficient_std_error', 'Coefficient_P_value']
     results_data = []
-    for (name, ct_ld_chr) in [x.split() for x in open(args.ref_ld_chr_cts).readlines()]:
+    with open(args.ref_ld_chr_cts) as ref_ld_chr_cts:
+        ref_ld_entries = [line.split() for line in ref_ld_chr_cts]
+    for (name, ct_ld_chr) in ref_ld_entries:
         ref_ld_cts_allsnps = _read_chr_split_files(ct_ld_chr, None, log,
                                    'cts reference panel LD Score', ps.ldscore_fromlist)
         log.log('Performing regression.')
-        ref_ld_cts = np.array(pd.merge(keep_snps, ref_ld_cts_allsnps, on='SNP', how='left').ix[:,1:])
+        ref_ld_cts = np.array(pd.merge(keep_snps, ref_ld_cts_allsnps, on='SNP', how='left').iloc[:,1:])
         if np.any(np.isnan(ref_ld_cts)):
             raise ValueError ('Missing some LD scores from cts files. Are you sure all SNPs in ref-ld-chr are also in ref-ld-chr-cts')
 
@@ -319,8 +321,8 @@ def estimate_h2(args, log):
     '''Estimate h2 and partitioned h2.'''
     args = copy.deepcopy(args)
     if args.samp_prev is not None and args.pop_prev is not None:
-        args.samp_prev, args.pop_prev = map(
-            float, [args.samp_prev, args.pop_prev])
+        args.samp_prev, args.pop_prev = [
+            float(x) for x in (args.samp_prev, args.pop_prev)]
     if args.intercept_h2 is not None:
         args.intercept_h2 = float(args.intercept_h2)
     if args.no_intercept:
@@ -347,7 +349,7 @@ def estimate_h2(args, log):
     chisq = s(sumstats.Z**2)
     if chisq_max is not None:
         ii = np.ravel(chisq < chisq_max)
-        sumstats = sumstats.ix[ii, :]
+        sumstats = sumstats.loc[ii, :]
         log.log('Removed {M} SNPs with chi^2 > {C} ({N} SNPs remain)'.format(
                 C=chisq_max, N=np.sum(ii), M=n_snp-np.sum(ii)))
         n_snp = np.sum(ii)  # lambdas are late-binding, so this works
@@ -387,8 +389,9 @@ def estimate_rg(args, log):
 
        '''
     # print(args)
-    user_frames = args.sumstats_frames is not None
+    user_frames = getattr(args, 'sumstats_frames', None) is not None
     args = copy.deepcopy(args)
+    args.rg_mat = getattr(args, 'rg_mat', False)
     if not user_frames:
         rg_paths, rg_files = _parse_rg(args.rg, args.rg_mat)
         n_pheno = len(rg_paths)
@@ -398,15 +401,16 @@ def estimate_rg(args, log):
         rg_frames_1 = args.sumstats_frames if args.rg_mat else  args.sumstats_frames[:1]
 
     f = lambda x: _split_or_none(x, n_pheno)
-    args.intercept_h2, args.intercept_gencov, args.samp_prev, args.pop_prev = map(f,
-        (args.intercept_h2, args.intercept_gencov, args.samp_prev, args.pop_prev))
-    map(lambda x: _check_arg_len(x, n_pheno), ((args.intercept_h2, '--intercept-h2'),
-                                               (args.intercept_gencov, '--intercept-gencov'),
-                                               (args.samp_prev, '--samp-prev'),
-                                               (args.pop_prev, '--pop-prev')))
+    args.intercept_h2, args.intercept_gencov, args.samp_prev, args.pop_prev = [
+        f(x) for x in (args.intercept_h2, args.intercept_gencov, args.samp_prev, args.pop_prev)]
+    for arg in ((args.intercept_h2, '--intercept-h2'),
+                (args.intercept_gencov, '--intercept-gencov'),
+                (args.samp_prev, '--samp-prev'),
+                (args.pop_prev, '--pop-prev')):
+        _check_arg_len(arg, n_pheno)
     if args.no_intercept:
-        args.intercept_h2 = [1 for _ in xrange(n_pheno)]
-        args.intercept_gencov = [0 for _ in xrange(n_pheno)]
+        args.intercept_h2 = [1 for _ in range(n_pheno)]
+        args.intercept_gencov = [0 for _ in range(n_pheno)]
     rg_paths_1 = rg_paths if args.rg_mat else rg_paths[:1]
 
     RG = []
@@ -415,7 +419,7 @@ def estimate_rg(args, log):
     rg_list_2 = args.sumstats_frames if user_frames else rg_paths
     rg_name_tups = []
     for k, p1_orig in enumerate(rg_list_1):
-        p1 = p1_orig.copy()
+        p1 = p1_orig.copy() if user_frames else p1_orig
         #print(k+1)
         #print(p1.columns)
         out_prefix = args.out + rg_files[k] # YYY make --out writing optional with dataframes
@@ -429,9 +433,10 @@ def estimate_rg(args, log):
         if args.two_step is not None:
             log.log('Using two-step estimator with cutoff at {M}.'.format(M=args.two_step))
 
-        for i in range(k, n_pheno):
+        start = k if args.rg_mat else k + 1
+        for i in range(start, n_pheno):
             #print(i)
-            p2 = rg_list_2[i].copy()
+            p2 = rg_list_2[i].copy() if user_frames else rg_list_2[i]
             #print(p2.columns)
 
             log.log(
@@ -474,7 +479,7 @@ def estimate_rg(args, log):
             for j in range(i, n_pheno):
                 X[j,i] =  X[i,j]
         RG = X
-        # RG = [RG[k,i] for  k in xrange(len(rg_paths_1)) for i in xrange(k+i, len(rg_paths))]
+        # RG = [RG[k, i] for k in range(len(rg_paths_1)) for i in range(k + i, len(rg_paths))]
     return RG # RG is now a matrix with None on the diagonals
 
 
@@ -501,26 +506,25 @@ def _get_rg_table(rg_path_tups, RG, args):
     '''Print a table of genetic correlations.'''
     t = lambda attr: lambda obj: getattr(obj, attr, 'NA')
     x = pd.DataFrame()
-    x['p1'] = [rg_path_tups[i][0] for i in xrange(len(RG))]
-    x['p2'] = [rg_path_tups[i][1] for i in xrange(len(RG))]
-    x['rg'] = map(t('rg_ratio'), RG)
-    x['se'] = map(t('rg_se'), RG)
-    x['z'] = map(t('z'), RG)
-    x['p'] = map(t('p'), RG)
+    x['p1'] = [rg_path_tups[i][0] for i in range(len(RG))]
+    x['p2'] = [rg_path_tups[i][1] for i in range(len(RG))]
+    x['rg'] = list(map(t('rg_ratio'), RG))
+    x['se'] = list(map(t('rg_se'), RG))
+    x['z'] = list(map(t('z'), RG))
+    x['p'] = list(map(t('p'), RG))
     if args.samp_prev is not None and args.pop_prev is not None and\
-            all((i is not None for i in args.samp_prev)) and all((i is not None for it in args.pop_prev)):
+            all((i is not None for i in args.samp_prev)) and all((i is not None for i in args.pop_prev)):
         c = reg.h2_obs_to_liab(1, args.samp_prev[1], args.pop_prev[1])
-        x['h2_liab'] = map(lambda x: c * x, map(t('tot'), map(t('hsq2'), RG)))
-        x['h2_liab_se'] = map(
-            lambda x: c * x, map(t('tot_se'), map(t('hsq2'), RG)))
+        x['h2_liab'] = [c * value for value in map(t('tot'), map(t('hsq2'), RG))]
+        x['h2_liab_se'] = [c * value for value in map(t('tot_se'), map(t('hsq2'), RG))]
     else:
-        x['h2_obs'] = map(t('tot'), map(t('hsq2'), RG))
-        x['h2_obs_se'] = map(t('tot_se'), map(t('hsq2'), RG))
+        x['h2_obs'] = list(map(t('tot'), map(t('hsq2'), RG)))
+        x['h2_obs_se'] = list(map(t('tot_se'), map(t('hsq2'), RG)))
 
-    x['h2_int'] = map(t('intercept'), map(t('hsq2'), RG))
-    x['h2_int_se'] = map(t('intercept_se'), map(t('hsq2'), RG))
-    x['gcov_int'] = map(t('intercept'), map(t('gencov'), RG))
-    x['gcov_int_se'] = map(t('intercept_se'), map(t('gencov'), RG))
+    x['h2_int'] = list(map(t('intercept'), map(t('hsq2'), RG)))
+    x['h2_int_se'] = list(map(t('intercept_se'), map(t('hsq2'), RG)))
+    x['gcov_int'] = list(map(t('intercept'), map(t('gencov'), RG)))
+    x['gcov_int_se'] = list(map(t('intercept_se'), map(t('gencov'), RG)))
     return x.to_string(header=True, index=False) + '\n'
 
 def _print_gencor(args, log, rghat, ref_ld_cnames, i1,i2, rg_paths, print_hsq1):
@@ -560,12 +564,6 @@ def _filter_alleles(alleles):
 
 def _align_alleles(z, alleles):
     '''Align Z1 and Z2 to same choice of ref allele (allowing for strand flip).'''
-    # logging.info(alleles[:100])
-    # logging.info(FLIP_ALLELES)
-    # logging.info('XXX Number of bad alleles: {}'.format(len(alleles) - len(np.in1d(alleles, FLIP_ALLELES)) ))
-
-    z *= (-1) ** alleles.apply(lambda y: FLIP_ALLELES[y])
-
     try:
         z *= (-1) ** alleles.apply(lambda y: FLIP_ALLELES[y])
     except KeyError as e:
@@ -584,7 +582,7 @@ def _rg(sumstats, args, log, M_annot, ref_ld_cnames, w_ld_cname, i1, i2):
         n_snp = np.sum(ii)  # lambdas are late binding, so this works
         sumstats = sumstats[ii]
     n_blocks = min(args.n_blocks, n_snp)
-    ref_ld = sumstats.as_matrix(columns=ref_ld_cnames)
+    ref_ld = sumstats.loc[:, ref_ld_cnames].to_numpy()
     intercepts = [args.intercept_h2[i1], args.intercept_h2[i2], args.intercept_gencov[i2]]
     rghat = reg.RG(s(sumstats.Z1), s(sumstats.Z2),
                    ref_ld, s(sumstats[w_ld_cname]), s(
@@ -622,9 +620,9 @@ def _print_rg_cov(rghat, fh, log):
 
 def _split_or_none(x, n):
     if x is not None:
-        y = map(float, x.replace('N', '-').split(','))
+        y = list(map(float, x.replace('N', '-').split(',')))
     else:
-        y = [None for _ in xrange(n)]
+        y = [None for _ in range(n)]
     return y
 
 
