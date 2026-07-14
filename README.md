@@ -72,19 +72,15 @@ The maxFDR estimate is written to `results/mtag_max_fdr.txt`. With the Numba
 backend, the default max-only calculation keeps memory bounded and does not
 materialize the complete grid. For five or more traits, it now uses an exact
 branch-and-prune search: it builds causal-state distributions a trait at a time
-and rejects a partial distribution only when its scaled Omega principal matrix
-proves that no PSD full matrix can descend from it. The surviving full
-distributions are evaluated with the same maxFDR calculation and historical
-grid-order tie-breaking as exhaustive search. This approach makes the process
-more efficient and does not require any approximations so does not change the
-output.
-
-Branch tables store only occupied causal states. At `--intervals 10`, every grid
-point contains ten probability units and can therefore occupy at most ten
-states, even though there are theoretically `2^T` states.
+in an exact depth-first traversal and rejects a partial distribution only when
+its scaled Omega principal matrix proves that no PSD full matrix can descend
+from it. Remaining full distributions are evaluated with the same maxFDR
+calculation and historical grid-order tie-breaking as exhaustive search. This
+approach makes the process more efficient and does not require any
+approximations so does not change the output.
 
 `--fdr-search exhaustive` selects the bounded exhaustive Numba implementation as
-a compatibility reference. A branch-search memory guard falls back to that
+a compatibility reference. A branch-seed memory guard falls back to that
 implementation only for reasonably sized grids. Add `--fdr-write-full-grid` if
 you also need the historical probability-grid and FDR-matrix files; full-grid
 output necessarily uses the exhaustive search. Custom `--grid_file` inputs

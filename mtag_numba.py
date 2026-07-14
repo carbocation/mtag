@@ -1385,6 +1385,23 @@ def candidate_seed_orders(omega, seed_traits=3, trial_limit=32):
             itertools.combinations(range(num_traits), seed_traits)
         )
         return sorted(orders, key=lambda order: (-score(order), order))
+    if seed_traits == 2:
+        pairs = [
+            (correlation[first, second], first, second)
+            for first in range(num_traits)
+            for second in range(first + 1, num_traits)
+        ]
+        pairs.sort(key=lambda value: (-value[0], value[1], value[2]))
+        candidates = [(0, 1)]
+        candidates.extend(
+            (first, second)
+            for _, first, second in pairs
+            if (first, second) != (0, 1)
+        )
+        return sorted(
+            candidates[:trial_limit],
+            key=lambda order: (-score(order), order),
+        )
     if seed_traits != 3:
         return [tuple(range(seed_traits))]
 
@@ -1686,6 +1703,667 @@ def _evaluate_sparse_branch_leaves_kernel(
     )
 
 
+@njit(inline="always")
+def _advance_sparse_split(split_counts, parent_counts, occupied):
+    """Advance a mixed-radix causal split and report whether one remains."""
+    position = occupied - 1
+    while position >= 0:
+        if split_counts[position] < parent_counts[position]:
+            split_counts[position] += 1
+            return True
+        split_counts[position] = 0
+        position -= 1
+    return False
+
+
+@njit(inline="always")
+def _build_sparse_child_from_split(
+    parent_ids,
+    parent_counts,
+    parent_occupied,
+    parent_pair_counts,
+    parent_cholesky,
+    parent_factor_valid,
+    split_counts,
+    intervals,
+    omega,
+    prune_tolerance,
+    fit_ss,
+    pi_causal_ss,
+    child_ids,
+    child_counts,
+    child_pair_counts,
+    child_cholesky,
+):
+    """Build and check one child without allocating a frontier row."""
+    parent_traits = parent_cholesky.shape[0]
+    child_traits = parent_traits + 1
+    parent_pairs = parent_traits * (parent_traits + 1) // 2
+    child_pairs = child_traits * (child_traits + 1) // 2
+    child_pair_counts[:parent_pairs] = parent_pair_counts[:parent_pairs]
+    child_pair_counts[parent_pairs:child_pairs] = 0
+
+    for occupied_index in range(parent_occupied):
+        causal_count = split_counts[occupied_index]
+        if causal_count == 0:
+            continue
+        state = parent_ids[occupied_index]
+        for trait in range(parent_traits):
+            if _sparse_state_has_trait(state, trait, parent_traits):
+                child_pair_counts[parent_pairs + trait] += causal_count
+        child_pair_counts[parent_pairs + parent_traits] += causal_count
+
+    for pair_number in range(parent_pairs, child_pairs):
+        if child_pair_counts[pair_number] == 0:
+            return False, 0, False, 0
+    if fit_ss and abs(
+        child_pair_counts[child_pairs - 1] / intervals
+        - pi_causal_ss[parent_traits]
+    ) >= 1.0 / intervals:
+        return False, 0, False, 0
+
+    valid, factor_valid, fast_status = _bordered_principal_psd_check(
+        parent_cholesky,
+        parent_factor_valid,
+        child_pair_counts[:child_pairs],
+        intervals,
+        omega,
+        prune_tolerance,
+        child_cholesky,
+    )
+    if not valid:
+        return False, 0, False, fast_status
+
+    child_occupied = 0
+    for occupied_index in range(parent_occupied):
+        parent_state = parent_ids[occupied_index]
+        causal_count = split_counts[occupied_index]
+        noncausal_count = parent_counts[occupied_index] - causal_count
+        if noncausal_count:
+            child_ids[child_occupied] = parent_state * np.uint64(2)
+            child_counts[child_occupied] = noncausal_count
+            child_occupied += 1
+        if causal_count:
+            child_ids[child_occupied] = (
+                parent_state * np.uint64(2) + np.uint64(1)
+            )
+            child_counts[child_occupied] = causal_count
+            child_occupied += 1
+    return True, child_occupied, factor_valid, fast_status
+
+
+@njit(inline="always")
+def _pair_signature_hash(pair_counts):
+    value = np.uint64(1469598103934665603)
+    multiplier = np.uint64(1099511628211)
+    for count in pair_counts:
+        value ^= np.uint64(count + 1)
+        value *= multiplier
+    return value
+
+
+@njit(inline="always")
+def _pair_signature_matches(first, second, length):
+    for index in range(length):
+        if first[index] != second[index]:
+            return False
+    return True
+
+
+@njit(inline="always")
+def _load_pair_signature_cache(
+    pair_counts,
+    intervals,
+    omega,
+    cache_hashes,
+    cache_generations,
+    cache_valid,
+    cache_psd,
+    cache_pair_counts,
+    cache_scaled_omega,
+    scaled_omega,
+):
+    """Load or exactly compute one final scaled-Omega signature."""
+    num_traits = omega.shape[0]
+    num_pairs = num_traits * (num_traits + 1) // 2
+    signature_hash = _pair_signature_hash(pair_counts[:num_pairs])
+    slot = int(signature_hash % np.uint64(len(cache_valid)))
+    hit = (
+        cache_valid[slot] != 0
+        and cache_hashes[slot] == signature_hash
+        and _pair_signature_matches(
+            pair_counts, cache_pair_counts[slot], num_pairs
+        )
+    )
+    if hit:
+        scaled_omega[:] = cache_scaled_omega[slot]
+        return (
+            cache_psd[slot] != 0,
+            slot,
+            cache_generations[slot],
+            signature_hash,
+            True,
+        )
+
+    _build_scaled_omega_lower(
+        pair_counts[:num_pairs], intervals, omega, scaled_omega
+    )
+    psd_status = _fast_psd_status(scaled_omega)
+    psd_valid = psd_status >= 0
+    if psd_status == 0:
+        eigenvalues = np.linalg.eigvalsh(scaled_omega)
+        max_abs_eigenvalue = 1.0
+        for eigenvalue in eigenvalues:
+            max_abs_eigenvalue = max(
+                max_abs_eigenvalue, abs(eigenvalue)
+            )
+        tolerance = (
+            np.finfo(np.float64).eps
+            * max_abs_eigenvalue
+            * num_traits
+        )
+        psd_valid = eigenvalues[0] >= -tolerance
+
+    cache_generations[slot] += 1
+    cache_hashes[slot] = signature_hash
+    cache_valid[slot] = 1
+    cache_psd[slot] = 1 if psd_valid else 0
+    cache_pair_counts[slot, :num_pairs] = pair_counts[:num_pairs]
+    cache_scaled_omega[slot] = scaled_omega
+    return (
+        psd_valid,
+        slot,
+        cache_generations[slot],
+        signature_hash,
+        False,
+    )
+
+
+@njit(inline="always")
+def _load_state_power_cache(
+    state,
+    pair_slot,
+    pair_generation,
+    signature_hash,
+    scaled_omega,
+    num_left,
+    num_right,
+    denominator,
+    sigma_numerator,
+    n_counts,
+    n_total,
+    z_threshold,
+    cache_valid,
+    cache_pair_slots,
+    cache_pair_generations,
+    cache_states,
+    cache_powers,
+    power_output,
+):
+    """Load or exactly compute all-trait power for one state/signature."""
+    mixed_hash = signature_hash ^ (
+        state * np.uint64(11400714819323198485)
+    )
+    slot = int(mixed_hash % np.uint64(len(cache_valid)))
+    hit = (
+        cache_valid[slot] != 0
+        and cache_pair_slots[slot] == pair_slot
+        and cache_pair_generations[slot] == pair_generation
+        and cache_states[slot] == state
+    )
+    if hit:
+        power_output[:] = cache_powers[slot]
+        return True
+
+    num_traits = scaled_omega.shape[0]
+    sqrt_two = math.sqrt(2.0)
+    for trait in range(num_traits):
+        probability_significant = 0.0
+        for n_index in range(len(n_counts)):
+            omega_numerator = 0.0
+            for first_trait in range(num_traits):
+                if not _sparse_state_has_trait(
+                    state, first_trait, num_traits
+                ):
+                    continue
+                for second_trait in range(num_traits):
+                    if _sparse_state_has_trait(
+                        state, second_trait, num_traits
+                    ):
+                        omega_numerator += (
+                            num_left[trait, n_index, first_trait]
+                            * scaled_omega[first_trait, second_trait]
+                            * num_right[trait, n_index, second_trait]
+                        )
+            variance = (
+                omega_numerator + sigma_numerator[trait, n_index]
+            ) / denominator[trait, n_index]
+            sd = math.sqrt(variance)
+            probability_significant += (
+                math.erfc(z_threshold / (sqrt_two * sd))
+                * n_counts[n_index]
+            )
+        power_output[trait] = probability_significant / n_total
+
+    cache_valid[slot] = 1
+    cache_pair_slots[slot] = pair_slot
+    cache_pair_generations[slot] = pair_generation
+    cache_states[slot] = state
+    cache_powers[slot] = power_output
+    return False
+
+
+@njit(cache=True)
+def _evaluate_one_streamed_leaf(
+    reordered_ids,
+    reordered_counts,
+    occupied,
+    trait_order,
+    intervals,
+    omega,
+    num_left,
+    num_right,
+    denominator,
+    sigma_numerator,
+    n_counts,
+    n_total,
+    z_threshold,
+    fit_ss,
+    pi_causal_ss,
+    original_ids,
+    original_counts,
+    original_pair_counts,
+    scaled_omega,
+    candidate_fdr,
+    state_power,
+    total_power,
+    false_discovery_power,
+    pair_cache_hashes,
+    pair_cache_generations,
+    pair_cache_valid,
+    pair_cache_psd,
+    pair_cache_counts,
+    pair_cache_scaled,
+    power_cache_valid,
+    power_cache_pair_slots,
+    power_cache_pair_generations,
+    power_cache_states,
+    power_cache_values,
+):
+    """Evaluate one DFS leaf and update only verified exact caches."""
+    num_traits = omega.shape[0]
+    num_pairs = num_traits * (num_traits + 1) // 2
+    for occupied_index in range(occupied):
+        original_ids[occupied_index] = _map_sparse_state_to_original(
+            reordered_ids[occupied_index], trait_order
+        )
+        original_counts[occupied_index] = reordered_counts[occupied_index]
+    _sort_sparse_state_counts(original_ids, original_counts, occupied)
+    _seed_pair_counts(
+        original_ids,
+        original_counts,
+        occupied,
+        num_traits,
+        original_pair_counts,
+    )
+    if fit_ss and not _marginals_match_spike_slab_lower(
+        original_pair_counts,
+        intervals,
+        num_traits,
+        pi_causal_ss,
+    ):
+        return False, False, 0, 0
+
+    (
+        psd_valid,
+        pair_slot,
+        pair_generation,
+        signature_hash,
+        pair_hit,
+    ) = _load_pair_signature_cache(
+        original_pair_counts[:num_pairs],
+        intervals,
+        omega,
+        pair_cache_hashes,
+        pair_cache_generations,
+        pair_cache_valid,
+        pair_cache_psd,
+        pair_cache_counts,
+        pair_cache_scaled,
+        scaled_omega,
+    )
+    if not psd_valid:
+        return False, pair_hit, 0, 0
+
+    total_power[:] = 0.0
+    false_discovery_power[:] = 0.0
+    power_hits = 0
+    power_misses = 0
+    for occupied_index in range(occupied):
+        state = original_ids[occupied_index]
+        power_hit = _load_state_power_cache(
+            state,
+            pair_slot,
+            pair_generation,
+            signature_hash,
+            scaled_omega,
+            num_left,
+            num_right,
+            denominator,
+            sigma_numerator,
+            n_counts,
+            n_total,
+            z_threshold,
+            power_cache_valid,
+            power_cache_pair_slots,
+            power_cache_pair_generations,
+            power_cache_states,
+            power_cache_values,
+            state_power,
+        )
+        if power_hit:
+            power_hits += 1
+        else:
+            power_misses += 1
+        for trait in range(num_traits):
+            # Preserve the historical operation order exactly: multiply by
+            # the integer count first, then divide by the lattice size.
+            weighted_power = (
+                state_power[trait]
+                * original_counts[occupied_index]
+                / intervals
+            )
+            total_power[trait] += weighted_power
+            if not _sparse_state_has_trait(state, trait, num_traits):
+                false_discovery_power[trait] += weighted_power
+    for trait in range(num_traits):
+        candidate_fdr[trait] = (
+            false_discovery_power[trait] / total_power[trait]
+        )
+    return True, pair_hit, power_hits, power_misses
+
+
+@njit(cache=True)
+def _depth_first_sparse_branch_kernel(
+    seed_ids,
+    seed_counts,
+    seed_occupied,
+    seed_pair_counts,
+    seed_cholesky,
+    seed_factor_valid,
+    seed_traits,
+    trait_order,
+    intervals,
+    ordered_omega,
+    prune_tolerance,
+    omega,
+    num_left,
+    num_right,
+    denominator,
+    sigma_numerator,
+    n_counts,
+    n_total,
+    z_threshold,
+    fit_ss,
+    ordered_pi_causal_ss,
+    original_pi_causal_ss,
+    pair_cache_size,
+    power_cache_size,
+):
+    """Traverse every descendant depth-first with bounded stack memory."""
+    num_traits = omega.shape[0]
+    max_pairs = num_traits * (num_traits + 1) // 2
+    stack_ids = np.zeros(
+        (num_traits + 1, intervals), dtype=np.uint64
+    )
+    stack_counts = np.zeros(
+        (num_traits + 1, intervals), dtype=np.int64
+    )
+    stack_occupied = np.zeros(num_traits + 1, dtype=np.int64)
+    stack_pairs = np.zeros(
+        (num_traits + 1, max_pairs), dtype=np.int64
+    )
+    stack_cholesky = np.zeros(
+        (num_traits + 1, num_traits, num_traits), dtype=np.float64
+    )
+    stack_factor_valid = np.zeros(num_traits + 1, dtype=np.uint8)
+    split_counts = np.zeros(
+        (num_traits + 1, intervals), dtype=np.int64
+    )
+    # 0 = uninitialized, 1 = another split is ready, and 2 = the split
+    # just descended into was the last one at this depth.  Keeping the
+    # exhausted state distinct prevents a return from a child from
+    # restarting the parent's mixed-radix counter at zero.
+    split_state = np.zeros(num_traits + 1, dtype=np.uint8)
+
+    pair_cache_hashes = np.zeros(pair_cache_size, dtype=np.uint64)
+    pair_cache_generations = np.zeros(pair_cache_size, dtype=np.int64)
+    pair_cache_valid = np.zeros(pair_cache_size, dtype=np.uint8)
+    pair_cache_psd = np.zeros(pair_cache_size, dtype=np.uint8)
+    pair_cache_counts = np.zeros(
+        (pair_cache_size, max_pairs), dtype=np.int64
+    )
+    pair_cache_scaled = np.zeros(
+        (pair_cache_size, num_traits, num_traits), dtype=np.float64
+    )
+    power_cache_valid = np.zeros(power_cache_size, dtype=np.uint8)
+    power_cache_pair_slots = np.zeros(power_cache_size, dtype=np.int64)
+    power_cache_pair_generations = np.zeros(
+        power_cache_size, dtype=np.int64
+    )
+    power_cache_states = np.zeros(power_cache_size, dtype=np.uint64)
+    power_cache_values = np.zeros(
+        (power_cache_size, num_traits), dtype=np.float64
+    )
+
+    max_fdr = np.full(num_traits, -np.inf, dtype=np.float64)
+    best_ids = np.zeros((num_traits, intervals), dtype=np.uint64)
+    best_counts = np.zeros((num_traits, intervals), dtype=np.int64)
+    best_occupied = np.zeros(num_traits, dtype=np.int64)
+    original_ids = np.empty(intervals, dtype=np.uint64)
+    original_counts = np.empty(intervals, dtype=np.int64)
+    original_pair_counts = np.empty(max_pairs, dtype=np.int64)
+    scaled_omega = np.empty(
+        (num_traits, num_traits), dtype=np.float64
+    )
+    candidate_fdr = np.empty(num_traits, dtype=np.float64)
+    state_power = np.empty(num_traits, dtype=np.float64)
+    total_power = np.empty(num_traits, dtype=np.float64)
+    false_discovery_power = np.empty(num_traits, dtype=np.float64)
+    level_visited = np.zeros(num_traits, dtype=np.int64)
+    level_retained = np.zeros(num_traits, dtype=np.int64)
+    fast_accepts = np.zeros(num_traits, dtype=np.int64)
+    fast_rejects = np.zeros(num_traits, dtype=np.int64)
+    eigen_fallbacks = np.zeros(num_traits, dtype=np.int64)
+    feasible_count = 0
+    invalid = False
+    pair_hits = 0
+    pair_misses = 0
+    power_hits = 0
+    power_misses = 0
+
+    seed_pairs = seed_traits * (seed_traits + 1) // 2
+    for seed_index in range(len(seed_occupied)):
+        occupied = seed_occupied[seed_index]
+        stack_ids[seed_traits, :occupied] = seed_ids[
+            seed_index, :occupied
+        ]
+        stack_counts[seed_traits, :occupied] = seed_counts[
+            seed_index, :occupied
+        ]
+        stack_occupied[seed_traits] = occupied
+        stack_pairs[seed_traits, :seed_pairs] = seed_pair_counts[
+            seed_index, :seed_pairs
+        ]
+        stack_cholesky[
+            seed_traits, :seed_traits, :seed_traits
+        ] = seed_cholesky[seed_index]
+        stack_factor_valid[seed_traits] = seed_factor_valid[seed_index]
+        split_state[:] = 0
+        depth = seed_traits
+
+        while depth >= seed_traits:
+            if depth == num_traits:
+                (
+                    valid_leaf,
+                    pair_hit,
+                    leaf_power_hits,
+                    leaf_power_misses,
+                ) = _evaluate_one_streamed_leaf(
+                    stack_ids[depth],
+                    stack_counts[depth],
+                    stack_occupied[depth],
+                    trait_order,
+                    intervals,
+                    omega,
+                    num_left,
+                    num_right,
+                    denominator,
+                    sigma_numerator,
+                    n_counts,
+                    n_total,
+                    z_threshold,
+                    fit_ss,
+                    original_pi_causal_ss,
+                    original_ids,
+                    original_counts,
+                    original_pair_counts,
+                    scaled_omega,
+                    candidate_fdr,
+                    state_power,
+                    total_power,
+                    false_discovery_power,
+                    pair_cache_hashes,
+                    pair_cache_generations,
+                    pair_cache_valid,
+                    pair_cache_psd,
+                    pair_cache_counts,
+                    pair_cache_scaled,
+                    power_cache_valid,
+                    power_cache_pair_slots,
+                    power_cache_pair_generations,
+                    power_cache_states,
+                    power_cache_values,
+                )
+                if pair_hit:
+                    pair_hits += 1
+                else:
+                    pair_misses += 1
+                power_hits += leaf_power_hits
+                power_misses += leaf_power_misses
+                if valid_leaf:
+                    feasible_count += 1
+                    row_occupied = stack_occupied[depth]
+                    for trait in range(num_traits):
+                        value = candidate_fdr[trait]
+                        if (
+                            not math.isfinite(value)
+                            or value < -1.0e-12
+                            or value > 1.0 + 1.0e-12
+                        ):
+                            invalid = True
+                        value = min(1.0, max(0.0, value))
+                        if (
+                            value > max_fdr[trait]
+                            or (
+                                value == max_fdr[trait]
+                                and _sparse_count_vector_precedes(
+                                    original_ids,
+                                    original_counts,
+                                    row_occupied,
+                                    best_ids[trait],
+                                    best_counts[trait],
+                                    best_occupied[trait],
+                                )
+                            )
+                        ):
+                            max_fdr[trait] = value
+                            best_ids[trait, :row_occupied] = original_ids[
+                                :row_occupied
+                            ]
+                            best_counts[trait, :row_occupied] = (
+                                original_counts[:row_occupied]
+                            )
+                            best_occupied[trait] = row_occupied
+                depth -= 1
+                continue
+
+            if split_state[depth] == 2:
+                split_state[depth] = 0
+                depth -= 1
+                continue
+            if split_state[depth] == 0:
+                split_counts[depth] = 0
+                split_state[depth] = 1
+
+            level_visited[depth] += 1
+            child_traits = depth + 1
+            child_omega = ordered_omega[:child_traits, :child_traits]
+            valid, child_occupied, factor_valid, fast_status = (
+                _build_sparse_child_from_split(
+                    stack_ids[depth],
+                    stack_counts[depth],
+                    stack_occupied[depth],
+                    stack_pairs[depth],
+                    stack_cholesky[depth, :depth, :depth],
+                    stack_factor_valid[depth] != 0,
+                    split_counts[depth],
+                    intervals,
+                    child_omega,
+                    prune_tolerance,
+                    fit_ss,
+                    ordered_pi_causal_ss,
+                    stack_ids[child_traits],
+                    stack_counts[child_traits],
+                    stack_pairs[child_traits],
+                    stack_cholesky[
+                        child_traits, :child_traits, :child_traits
+                    ],
+                )
+            )
+            has_next = _advance_sparse_split(
+                split_counts[depth],
+                stack_counts[depth],
+                stack_occupied[depth],
+            )
+            if not has_next:
+                split_state[depth] = 2
+            if fast_status > 0:
+                fast_accepts[depth] += 1
+            elif fast_status < 0:
+                fast_rejects[depth] += 1
+            elif valid:
+                eigen_fallbacks[depth] += 1
+
+            if valid:
+                level_retained[depth] += 1
+                stack_occupied[child_traits] = child_occupied
+                stack_factor_valid[child_traits] = 1 if factor_valid else 0
+                split_state[child_traits] = 0
+                depth = child_traits
+            elif not has_next:
+                split_state[depth] = 0
+                depth -= 1
+
+    return (
+        max_fdr,
+        best_ids,
+        best_counts,
+        best_occupied,
+        feasible_count,
+        invalid,
+        level_visited,
+        level_retained,
+        fast_accepts,
+        fast_rejects,
+        eigen_fallbacks,
+        pair_hits,
+        pair_misses,
+        power_hits,
+        power_misses,
+    )
+
+
 def _materialize_sparse_probability_rows(
     state_ids,
     counts,
@@ -1709,12 +2387,14 @@ def evaluate_automatic_grid_max_branch(
     omega,
     prepared,
     pi_causal_ss=None,
-    candidate_limit=10_000_000,
+    candidate_limit=None,
     table_byte_limit=256 * 1024 * 1024,
     seed_trial_limit=32,
     extension_trial_limit=16,
+    pair_cache_size=256,
+    power_cache_size=1,
 ):
-    """Exactly maximize maxFDR with sparse, incremental branch pruning."""
+    """Exactly maximize maxFDR with depth-first sparse branch pruning."""
     if intervals <= 0:
         raise ValueError("maxFDR intervals must be positive")
     omega = np.asarray(omega, dtype=np.float64)
@@ -1753,9 +2433,16 @@ def evaluate_automatic_grid_max_branch(
         if original_pi.shape != (num_traits,):
             raise ValueError("spike-slab probabilities must match traits")
 
-    seed_traits = min(3, num_traits)
+    # Three-trait seeds are cheap on the historical ten-interval lattice.
+    # Their grid grows as O(intervals**7), however, while a two-trait seed
+    # grows only as O(intervals**3).  The descendants are still traversed
+    # exhaustively, so this changes resource use rather than the result.
+    seed_traits = min(
+        2 if intervals > 10 and num_traits > 2 else 3,
+        num_traits,
+    )
     seed_candidates = automatic_grid_size(1 << seed_traits, intervals)
-    if seed_candidates > candidate_limit:
+    if candidate_limit is not None and seed_candidates > candidate_limit:
         raise BranchSearchLimitExceeded(
             "each branch seed would visit {:,} candidates".format(
                 seed_candidates
@@ -1817,115 +2504,91 @@ def evaluate_automatic_grid_max_branch(
             "memory guard".format(len(seed_orders))
         )
 
-    parents = best_seed
-    order = best_order
+    # Pick one fixed remaining order before traversal.  Trying a different
+    # order cannot change the exact feasible set; strong correlations first
+    # merely tend to expose violated principal constraints at shallower
+    # depths.  Unlike the old breadth-first implementation, no candidate
+    # frontier is materialized to compare alternative orders.
+    order = list(best_order)
     remaining = [trait for trait in range(num_traits) if trait not in order]
-    level_diagnostics = []
-    while remaining and len(parents):
-        extension_count = sparse_branch_extension_count(parents)
-        child_traits = len(order) + 1
-        required_bytes = (
-            extension_count
-            * _sparse_table_bytes_per_row(intervals, child_traits)
-        )
-        if (
-            extension_count > candidate_limit
-            or required_bytes > table_byte_limit
-        ):
-            raise BranchSearchLimitExceeded(
-                "branch level would visit {:,} candidates and allocate "
-                "approximately {:.1f} MiB".format(
-                    extension_count, required_bytes / (1024.0 * 1024.0)
-                )
-            )
-
-        best_children = None
-        best_trait = None
-        best_stats = None
-        extension_choices = candidate_extension_traits(
-            omega,
-            order,
-            remaining,
-            trial_limit=extension_trial_limit,
-        )
-        for candidate_trait in extension_choices:
-            candidate_order = order + [candidate_trait]
-            order_array = np.asarray(candidate_order, dtype=np.int64)
-            candidate_omega = omega[np.ix_(order_array, order_array)]
-            candidate_pi = (
-                None
-                if original_pi is None
-                else original_pi[order_array]
-            )
-            children, stats = expand_sparse_branch_tables(
-                parents,
-                intervals,
-                candidate_omega,
-                prune_tolerance,
-                pi_causal_ss=candidate_pi,
-            )
-            visited = stats[0]
-            if visited != extension_count:
-                raise RuntimeError("branch maxFDR extension count mismatch")
-            if best_children is None or len(children) < len(best_children):
-                best_children = children
-                best_trait = candidate_trait
-                best_stats = stats
-
-        order.append(best_trait)
-        remaining.remove(best_trait)
-        parents = best_children
-        level_diagnostics.append(
-            {
-                "trait": int(best_trait),
-                "candidates_per_choice": int(extension_count),
-                "choices_tested": int(len(extension_choices)),
-                "retained": int(len(parents)),
-                "fast_psd_accepts": int(best_stats[1]),
-                "fast_psd_rejects": int(best_stats[2]),
-                "eigen_fallbacks": int(best_stats[3]),
-            }
-        )
-
-    if remaining:
-        order.extend(remaining)
-        parents = _empty_sparse_branch_tables(intervals, num_traits)
+    while remaining:
+        next_trait = candidate_extension_traits(
+            omega, order, remaining, trial_limit=1
+        )[0]
+        order.append(next_trait)
+        remaining.remove(next_trait)
 
     order_array = np.asarray(order, dtype=np.int64)
+    ordered_omega = omega[np.ix_(order_array, order_array)]
     prepared_arrays = prepare_fdr_arrays(prepared)
     if original_pi is None:
         fit_ss = False
         final_pi = np.zeros(num_traits, dtype=np.float64)
+        ordered_pi = np.zeros(num_traits, dtype=np.float64)
     else:
         fit_ss = True
         final_pi = original_pi
+        ordered_pi = original_pi[order_array]
+
+    if pair_cache_size <= 0 or power_cache_size <= 0:
+        raise ValueError("branch cache sizes must be positive")
+    max_pairs = num_traits * (num_traits + 1) // 2
+    pair_entry_bytes = (
+        32 + 8 * max_pairs + 8 * num_traits * num_traits
+    )
+    power_entry_bytes = 32 + 8 * num_traits
+    cache_budget = max(1, int(table_byte_limit) // 4)
+    actual_pair_cache_size = max(
+        1,
+        min(int(pair_cache_size), cache_budget // pair_entry_bytes),
+    )
+    actual_power_cache_size = max(
+        1,
+        min(int(power_cache_size), cache_budget // power_entry_bytes),
+    )
     (
-        ordered_max_fdr,
-        ordered_best_ids,
-        ordered_best_counts,
-        ordered_best_occupied,
+        max_fdr,
+        best_ids,
+        best_counts,
+        best_occupied,
         feasible_count,
         invalid,
-    ) = _evaluate_sparse_branch_leaves_kernel(
-            parents.state_ids,
-            parents.counts,
-            parents.occupied,
-            order_array,
-            int(intervals),
-            omega,
-            *prepared_arrays,
-            fit_ss,
-            final_pi,
-        )
+        level_visited,
+        level_retained,
+        fast_accepts,
+        fast_rejects,
+        eigen_fallbacks,
+        pair_hits,
+        pair_misses,
+        power_hits,
+        power_misses,
+    ) = _depth_first_sparse_branch_kernel(
+        best_seed.state_ids,
+        best_seed.counts,
+        best_seed.occupied,
+        best_seed.pair_counts,
+        best_seed.cholesky,
+        best_seed.factor_valid,
+        int(seed_traits),
+        order_array,
+        int(intervals),
+        ordered_omega,
+        float(prune_tolerance),
+        omega,
+        *prepared_arrays,
+        fit_ss,
+        ordered_pi,
+        final_pi,
+        int(actual_pair_cache_size),
+        int(actual_power_cache_size),
+    )
     if invalid:
         raise ValueError(
             "maxFDR branch search returned a non-finite value or a value "
             "outside [0, 1]"
         )
-    max_fdr = ordered_max_fdr
-    best_ids = ordered_best_ids
-    best_counts = ordered_best_counts
-    best_occupied = ordered_best_occupied
+    if feasible_count == 0:
+        raise ValueError("no feasible maxFDR grid points found")
     maximizing_probabilities = _materialize_sparse_probability_rows(
         best_ids,
         best_counts,
@@ -1934,6 +2597,19 @@ def evaluate_automatic_grid_max_branch(
         num_states,
         table_byte_limit,
     )
+    level_diagnostics = []
+    for depth in range(seed_traits, num_traits):
+        level_diagnostics.append(
+            {
+                "trait": int(order[depth]),
+                "candidates_per_choice": int(level_visited[depth]),
+                "choices_tested": 1,
+                "retained": int(level_retained[depth]),
+                "fast_psd_accepts": int(fast_accepts[depth]),
+                "fast_psd_rejects": int(fast_rejects[depth]),
+                "eigen_fallbacks": int(eigen_fallbacks[depth]),
+            }
+        )
     diagnostics = {
         "exhaustive_candidates": int(exhaustive_candidates),
         "trait_order": [int(trait) for trait in order],
@@ -1952,9 +2628,17 @@ def evaluate_automatic_grid_max_branch(
         "seed_subsets_short_circuited": int(seed_orders_uncompetitive),
         "seed_retained": int(len(best_seed)),
         "levels": level_diagnostics,
-        "final_pruned_leaves": int(len(parents)),
+        "final_pruned_leaves": int(feasible_count),
         "representation": "sparse",
+        "traversal": "depth_first",
+        "frontier_rows_materialized": int(len(best_seed)),
         "maximum_occupied_states": int(intervals),
+        "pair_signature_cache_size": int(actual_pair_cache_size),
+        "pair_signature_cache_hits": int(pair_hits),
+        "pair_signature_cache_misses": int(pair_misses),
+        "state_power_cache_size": int(actual_power_cache_size),
+        "state_power_cache_hits": int(power_hits),
+        "state_power_cache_misses": int(power_misses),
     }
     return (
         max_fdr,

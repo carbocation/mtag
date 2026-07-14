@@ -375,11 +375,57 @@ def test_exact_branch_search_matches_exhaustive_numba(
         mtag_numba.automatic_grid_size(len(causal_states), intervals)
     )
     assert diagnostics["representation"] == "sparse"
+    assert diagnostics["traversal"] == "depth_first"
+    assert diagnostics["frontier_rows_materialized"] == diagnostics[
+        "seed_retained"
+    ]
     assert actual_count == expected_count
     np.testing.assert_array_equal(actual_max, expected_max)
     np.testing.assert_array_equal(
         actual_probabilities, expected_probabilities
     )
+
+
+def test_verified_branch_caches_preserve_results_under_collisions():
+    traits = 5
+    intervals = 5
+    omega = np.eye(traits) * 1.0e-5
+    sigma = np.eye(traits)
+    sample_sizes = np.full((1, traits), 100_000.0)
+    prepared = mtag._prepare_fdr_calculation(
+        omega, sigma, sample_sizes, np.ones(1), 5.0e-8
+    )
+
+    seed_candidate_limit = mtag_numba.automatic_grid_size(8, intervals)
+    cached = mtag_numba.evaluate_automatic_grid_max_branch(
+        intervals,
+        traits,
+        omega,
+        prepared,
+        candidate_limit=seed_candidate_limit,
+        pair_cache_size=4096,
+        power_cache_size=65536,
+    )
+    collision_heavy = mtag_numba.evaluate_automatic_grid_max_branch(
+        intervals,
+        traits,
+        omega,
+        prepared,
+        candidate_limit=seed_candidate_limit,
+        pair_cache_size=1,
+        power_cache_size=1,
+    )
+
+    assert cached[3]["pair_signature_cache_hits"] > 0
+    assert cached[3]["state_power_cache_hits"] > 0
+    assert max(
+        level["candidates_per_choice"] for level in cached[3]["levels"]
+    ) > seed_candidate_limit
+    assert collision_heavy[3]["pair_signature_cache_size"] == 1
+    assert collision_heavy[3]["state_power_cache_size"] == 1
+    assert collision_heavy[2] == cached[2]
+    np.testing.assert_array_equal(collision_heavy[0], cached[0])
+    np.testing.assert_array_equal(collision_heavy[1], cached[1])
 
 
 def test_sparse_branch_spike_slab_restriction_matches_exhaustive():
@@ -559,6 +605,8 @@ def test_real_five_trait_branch_regression_matches_historical_run():
     assert refined_count == 437
     assert refined_diagnostics["exhaustive_candidates"] == 77_535_155_627_160
     assert refined_diagnostics["final_pruned_leaves"] == 437
+    assert refined_diagnostics["seed_traits"] == 2
+    assert refined_diagnostics["traversal"] == "depth_first"
     np.testing.assert_array_equal(refined_max, expected_refined_max)
     assert np.all(refined_max >= max_fdr)
 
