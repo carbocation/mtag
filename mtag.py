@@ -80,7 +80,7 @@ def _read_SNPlist(file_path, SNP_index):
     snplist = pd.read_csv(file_path, header=0, index_col=False)
     if SNP_index not in snplist.columns:
         raise ValueError("SNPlist read from {} does not include --snp_name {} in its columns.".format(file_path, SNP_index))
-    return pd.read_csv(file_path, header=0, index_col=False)
+    return snplist
 
 def _read_GWAS_sumstats(GWAS_file_name, chunksize):
     '''
@@ -167,7 +167,7 @@ def _perform_munge(args, GWAS_df, GWAS_dat_gen,p):
     argnames.median_z_cutoff = args.median_z_cutoff
     munged_results = munge_sumstats.munge_sumstats(argnames, write_out=False, new_log=False)
     GWAS_df = GWAS_df.merge(munged_results, how='inner',left_on =args.snp_name,right_on='SNP',suffixes=('','_ss'))
-    
+
     if args.n_value is not None:
         GWAS_df = GWAS_df[list(original_cols) + ["N"]]
     else:
@@ -278,6 +278,756 @@ def _internal_column_renames(columns, args):
 
     return renames
 
+
+def _resolved_input_columns(columns, args):
+    """Map the one selected source column for each MTAG field."""
+    renames = _internal_column_renames(columns, args)
+    resolved = {}
+    recognized = {
+        'SNP', 'Z', 'N', 'FRQ', 'CHR', 'BP', 'A1', 'A2', 'P',
+        'INFO', 'SE',
+    }
+    for source in columns:
+        target = renames.get(source, source)
+        if target in recognized and target not in resolved:
+            resolved[target] = source
+    return resolved
+
+
+def _update_filter_counts(mask, condition, drops, key):
+    """Apply one legacy munge filter and record its incremental drop count."""
+    old_count = int(mask.sum())
+    mask &= np.asarray(condition, dtype=bool)
+    drops[key] += old_count - int(mask.sum())
+
+
+def _uppercase_by_unique_value(series):
+    """Uppercase a low-cardinality string Series without per-row callbacks."""
+    values = series.dropna().unique()
+    mapping = {value: value.upper() for value in values}
+    return series.map(mapping)
+
+
+def _trait_needs_position_columns(args, trait_index):
+    return (
+        not args.no_chr_data
+        and (trait_index == 0 or args.meta_format)
+    )
+
+
+def _load_trait_fast(args, file_path, trait_index):
+    """Read, QC, and retain one trait without a secondary munged dataframe.
+
+    This follows the filtering order used by ``mtag_munge.parse_dat``.  A
+    narrow copy of all raw core rows is retained alongside accepted SNP/N/Z
+    keys so the historical duplicate-SNP and raw-row selection semantics are
+    unchanged.
+    """
+    start_time = time.time()
+    (_, compression) = munge_sumstats.get_compression(file_path)
+    header = list(pd.read_csv(
+        file_path,
+        index_col=False,
+        header=0,
+        sep=r'\s+',
+        compression=compression,
+        nrows=0,
+    ).columns)
+    resolved = _resolved_input_columns(header, args)
+
+    required = ['SNP', 'Z', 'FRQ', 'A1', 'A2', 'P']
+    if args.n_value is None:
+        required.append('N')
+    if _trait_needs_position_columns(args, trait_index):
+        required.extend(['CHR', 'BP'])
+    if args.info_min_list[trait_index] is not None:
+        required.append('INFO')
+    missing = [field for field in required if field not in resolved]
+    if missing:
+        raise ValueError(
+            'Could not find required input columns for fast loading: {}'
+            .format(', '.join(missing))
+        )
+
+    read_targets = list(required)
+    if 'SE' in resolved:
+        read_targets.append('SE')
+    if 'N' in resolved and 'N' not in read_targets:
+        # Legacy munging considers an input N column when checking missing
+        # values even if --n_value later replaces it.
+        read_targets.append('N')
+    read_targets = list(dict.fromkeys(read_targets))
+    source_to_target = {
+        resolved[target]: target for target in read_targets
+    }
+    usecols = list(source_to_target)
+
+    logging.info(
+        'Read in Trait {} summary statistics from {} using the fused loader ...'
+        .format(trait_index + 1, file_path)
+    )
+    logging.info(borderline)
+    logging.info(
+        'Munging Trait {}  {}'.format(
+            trait_index + 1, borderline[:-17]
+        )
+    )
+    logging.info(borderline)
+    logging.info('Interpreting column names as follows:')
+    logging.info('\n'.join(
+        '{}:\t{}'.format(source, target)
+        for source, target in source_to_target.items()
+    ) + '\n')
+
+    filter_args = Namespace(
+        maf_min=args.maf_min_list[trait_index],
+        info_min=args.info_min_list[trait_index],
+    )
+    raw_columns = ['SNP', 'Z', 'FRQ', 'A1', 'A2']
+    if args.n_value is None:
+        raw_columns.append('N')
+    if _trait_needs_position_columns(args, trait_index):
+        raw_columns.extend(['CHR', 'BP'])
+
+    raw_chunks = []
+    accepted_masks = []
+    total_rows = 0
+    drops = {
+        'NA': 0, 'P': 0, 'INFO': 0, 'FRQ': 0,
+        'A': 0, 'SE': 0,
+    }
+    reader = pd.read_csv(
+        file_path,
+        index_col=False,
+        header=0,
+        sep=r'\s+',
+        compression=compression,
+        usecols=usecols,
+        na_values=['.', 'NA', 'NaN'],
+        iterator=True,
+        chunksize=int(args.chunksize),
+        dtype={resolved['Z']: np.float64},
+    )
+    for source_chunk in reader:
+        total_rows += len(source_chunk)
+        data = source_chunk.rename(columns=source_to_target)
+        data['A1'] = _uppercase_by_unique_value(data['A1'])
+        data['A2'] = _uppercase_by_unique_value(data['A2'])
+        raw_chunks.append(data[raw_columns].copy())
+
+        qc_columns = ['SNP', 'Z', 'FRQ', 'A1', 'A2', 'P']
+        if 'N' in data.columns:
+            qc_columns.append('N')
+        if 'SE' in data.columns:
+            qc_columns.append('SE')
+        mask = np.ones(len(data), dtype=bool)
+        for column in qc_columns:
+            mask &= data[column].notna().to_numpy()
+        drops['NA'] += len(data) - int(mask.sum())
+
+        if 'INFO' in data.columns:
+            _update_filter_counts(
+                mask,
+                munge_sumstats.filter_info(data['INFO'], filter_args),
+                drops,
+                'INFO',
+            )
+        _update_filter_counts(
+            mask,
+            munge_sumstats.filter_frq(data['FRQ'], filter_args),
+            drops,
+            'FRQ',
+        )
+        if 'SE' in data.columns:
+            _update_filter_counts(
+                mask,
+                munge_sumstats.filter_se(data['SE'], filter_args),
+                drops,
+                'SE',
+            )
+        _update_filter_counts(
+            mask,
+            munge_sumstats.filter_pvals(data['P'], filter_args),
+            drops,
+            'P',
+        )
+        allele_pairs = data['A1'] + data['A2']
+        _update_filter_counts(
+            mask,
+            munge_sumstats.filter_alleles(allele_pairs, True),
+            drops,
+            'A',
+        )
+
+        accepted_masks.append(mask)
+
+    raw = pd.concat(raw_chunks, axis=0, ignore_index=True)
+    accepted_mask = np.concatenate(accepted_masks)
+    accepted_before_dedup = int(accepted_mask.sum())
+    logging.info(
+        'Read {} SNPs from --sumstats file.\n'
+        'Removed {} SNPs with missing values.\n'
+        'Removed {} SNPs with INFO <= {}.\n'
+        'Removed {} SNPs with MAF <= {}.\n'
+        'Removed {} SNPs with SE <0 or NaN values.\n'
+        'Removed {} SNPs with out-of-bounds p-values.\n'
+        'Removed {} variants that were not SNPs. Note: strand ambiguous '
+        'SNPs were not dropped.\n'
+        '{} SNPs remain.'.format(
+            total_rows,
+            drops['NA'],
+            drops['INFO'],
+            args.info_min_list[trait_index],
+            drops['FRQ'],
+            args.maf_min_list[trait_index],
+            drops['SE'],
+            drops['P'],
+            drops['A'],
+            accepted_before_dedup,
+        )
+    )
+
+    if args.n_value is not None:
+        sample_size = args.n_list[trait_index]
+        logging.info(
+            'Adding uniform sample size {} to summary statistics.'.format(
+                sample_size
+            )
+        )
+        raw['N'] = sample_size
+
+    # Factorize SNPs once and use integer codes for both legacy duplicate
+    # decisions: the first QC-passing occurrence controls N filtering, while
+    # the first raw occurrence is retained in MTAG's output frame.
+    snp_codes, unique_snps = pd.factorize(raw['SNP'], sort=False)
+    position = np.arange(len(raw), dtype=np.int64)
+    valid_codes = snp_codes >= 0
+    accepted_position = np.full(len(unique_snps), len(raw), dtype=np.int64)
+    accepted_rows = accepted_mask & valid_codes
+    np.minimum.at(
+        accepted_position,
+        snp_codes[accepted_rows],
+        position[accepted_rows],
+    )
+    accepted_codes = accepted_position < len(raw)
+    accepted = raw.iloc[accepted_position[accepted_codes]][
+        ['SNP', 'Z', 'N']
+    ].reset_index(drop=True)
+    logging.info(
+        'Removed {} SNPs with duplicated rs numbers ({} SNPs remain).'
+        .format(accepted_before_dedup - len(accepted), len(accepted))
+    )
+    n_min = args.n_min_list[trait_index]
+    if n_min is None:
+        n_min = accepted['N'].quantile(0.9) / 1.5
+    old_count = len(accepted)
+    n_pass = accepted['N'].to_numpy() >= n_min
+    accepted_code_indices = np.flatnonzero(accepted_codes)
+    kept_code_indices = accepted_code_indices[n_pass]
+    accepted = accepted.loc[n_pass].reset_index(drop=True)
+    logging.info(
+        'Removed {} SNPs with N < {} ({} SNPs remain).'.format(
+            old_count - len(accepted), n_min, len(accepted)
+        )
+    )
+    logging.info(munge_sumstats.check_median(
+        accepted['Z'], 0.0, args.median_z_cutoff, 'SIGNED_SUMSTAT'
+    ))
+    logging.info('Dropping snps with null values')
+    chi_squared = np.square(accepted['Z'])
+    logging.info(
+        '\nMetadata:\nMean chi^2 = {}\nLambda GC = {}\nMax chi^2 = {}\n'
+        '{} Genome-wide significant SNPs (some may have been removed by '
+        'filtering).'.format(
+            round(chi_squared.mean(), 3),
+            round(chi_squared.median() / 0.4549, 3),
+            round(chi_squared.max(), 3),
+            int((chi_squared > 29).sum()),
+        )
+    )
+
+    kept_codes = np.zeros(len(unique_snps), dtype=bool)
+    kept_codes[kept_code_indices] = True
+    membership_mask = valid_codes & kept_codes[np.maximum(snp_codes, 0)]
+    z_checker = np.mean(np.square(raw.loc[membership_mask, 'Z']))
+    membership_count = int(membership_mask.sum())
+    first_raw_position = np.full(len(unique_snps), len(raw), dtype=np.int64)
+    np.minimum.at(
+        first_raw_position,
+        snp_codes[valid_codes],
+        position[valid_codes],
+    )
+    raw = raw.iloc[first_raw_position[kept_codes]].reset_index(drop=True)
+    logging.info(
+        '{}\nMunging of Trait {} complete. SNPs remaining:\t {}\n{}\n'
+        .format(borderline, trait_index + 1, membership_count, borderline)
+    )
+    duplicate_raw_count = membership_count - len(raw)
+    if duplicate_raw_count > 0:
+        logging.info(
+            'Trait {}: Dropped {} SNPs for duplicate values in the '
+            '"snp_name" column'.format(
+                trait_index + 1, duplicate_raw_count
+            )
+        )
+    logging.info(
+        'Fused loading and munging of Trait {} took {:.3f} seconds.'.format(
+            trait_index + 1, time.time() - start_time
+        )
+    )
+    return raw, total_rows, z_checker
+
+
+def _polars_module():
+    """Import the Rust-backed I/O engine with a single-thread default."""
+    os.environ.setdefault('POLARS_MAX_THREADS', '1')
+    try:
+        import polars as pl
+    except ImportError as exc:
+        raise ImportError(
+            'MTAG requires Polars; install the dependencies in '
+            'requirements.txt'
+        ) from exc
+    return pl
+
+
+def _has_tab_delimited_header(file_path):
+    """Return whether an input has the true TSV header Polars requires."""
+    return '\t' in _read_input_header(file_path)
+
+
+def _is_polars_input_compatible(file_path):
+    """Return whether Polars can directly parse this MTAG input."""
+    (_, compression) = munge_sumstats.get_compression(file_path)
+    return compression != 'bz2' and _has_tab_delimited_header(file_path)
+
+
+def _read_input_header(file_path):
+    """Read one header line as text from supported compression formats."""
+    (openfunc, _) = munge_sumstats.get_compression(file_path)
+    with openfunc(file_path, mode='r') as input_file:
+        header = input_file.readline()
+    if isinstance(header, bytes):
+        header = header.decode('utf-8')
+    return header
+
+
+def _polars_frame_to_pandas(frame):
+    """Convert a narrow Polars result without requiring PyArrow."""
+    values = {column: frame[column].to_numpy() for column in frame.columns}
+    chromosome_columns = [
+        column for column in values
+        if column == 'CHR' or re.fullmatch(r'CHR\d+', column)
+    ]
+    for column in chromosome_columns:
+        chromosomes = values[column].astype(object)
+        numeric = np.fromiter(
+            (
+                value is not None and value.lstrip('+-').isdigit()
+                for value in chromosomes
+            ),
+            dtype=bool,
+            count=len(chromosomes),
+        )
+        chromosomes[numeric] = np.asarray(
+            chromosomes[numeric], dtype=np.int64
+        )
+        values[column] = chromosomes
+    return pd.DataFrame(values)
+
+
+def _write_output_frame(args, frame, path, na_rep=''):
+    """Write a result table with the selected pandas or Polars backend."""
+    output_backend = getattr(args, 'output_backend', 'polars')
+    if getattr(args, 'legacy_loader', False):
+        output_backend = 'pandas'
+    if output_backend == 'pandas':
+        frame.to_csv(path, sep='\t', index=False, na_rep=na_rep)
+        return
+
+    pl = _polars_module()
+    values = {}
+    for column in frame.columns:
+        series = frame[column]
+        if series.dtype == object or isinstance(
+            series.dtype, pd.StringDtype
+        ):
+            # In particular, CHR can contain both integer autosomes and X/Y.
+            # Converting object columns to nullable strings avoids PyArrow and
+            # produces the same textual values as pandas' CSV writer.
+            values[column] = series.astype('string').to_numpy(
+                dtype=object, na_value=None
+            )
+        else:
+            values[column] = series.to_numpy()
+    output = pl.DataFrame(values)
+    float_columns = [
+        column for column, dtype in output.schema.items()
+        if dtype in (pl.Float32, pl.Float64)
+    ]
+    if float_columns:
+        # Polars distinguishes NaN from null. pandas to_csv applies na_rep to
+        # both, so normalize NaNs before writing for matching missing values.
+        output = output.with_columns([
+            pl.col(column).fill_nan(None) for column in float_columns
+        ])
+    output.write_csv(path, separator='\t', null_value=na_rep)
+
+
+def _load_trait_polars(args, file_path, trait_index, return_polars=False):
+    """Rust-backed TSV loader matching the fused pandas QC semantics."""
+    pl = _polars_module()
+    start_time = time.time()
+    header_line = _read_input_header(file_path)
+    if '\t' not in header_line:
+        raise ValueError(
+            '--load-backend polars currently requires tab-delimited input; '
+            'use --load-backend pandas for arbitrary whitespace delimiters'
+        )
+    header = header_line.rstrip('\r\n').split('\t')
+    resolved = _resolved_input_columns(header, args)
+
+    required = ['SNP', 'Z', 'FRQ', 'A1', 'A2', 'P']
+    if args.n_value is None:
+        required.append('N')
+    if _trait_needs_position_columns(args, trait_index):
+        required.extend(['CHR', 'BP'])
+    if args.info_min_list[trait_index] is not None:
+        required.append('INFO')
+    missing = [field for field in required if field not in resolved]
+    if missing:
+        raise ValueError(
+            'Could not find required input columns for Polars loading: {}'
+            .format(', '.join(missing))
+        )
+
+    read_targets = list(required)
+    if 'SE' in resolved:
+        read_targets.append('SE')
+    if 'N' in resolved and 'N' not in read_targets:
+        read_targets.append('N')
+    read_targets = list(dict.fromkeys(read_targets))
+    source_to_target = {
+        resolved[target]: target for target in read_targets
+    }
+    usecols = list(source_to_target)
+    schema = {}
+    for source, target in source_to_target.items():
+        if target in {'SNP', 'A1', 'A2', 'CHR'}:
+            schema[source] = pl.String
+        elif target == 'BP':
+            schema[source] = pl.Int64
+        elif target == 'N':
+            # Preserve integer sample-size columns when Polars can infer them;
+            # decimal effective-N columns continue to infer as Float64.
+            continue
+        else:
+            schema[source] = pl.Float64
+
+    logging.info(
+        'Read in Trait {} summary statistics from {} using Polars ...'.format(
+            trait_index + 1, file_path
+        )
+    )
+    data = pl.read_csv(
+        file_path,
+        separator='\t',
+        columns=usecols,
+        null_values=['.', 'NA', 'NaN'],
+        schema_overrides=schema,
+        infer_schema_length=10000,
+        rechunk=True,
+        n_threads=1,
+    ).rename(source_to_target).with_columns(
+        pl.col('A1').str.to_uppercase(),
+        pl.col('A2').str.to_uppercase(),
+    )
+    total_rows = len(data)
+    if args.n_value is not None:
+        sample_size = args.n_list[trait_index]
+        data = data.with_columns(
+            pl.lit(sample_size, dtype=pl.Int64).alias('N')
+        )
+        logging.info(
+            'Adding uniform sample size {} to summary statistics.'.format(
+                sample_size
+            )
+        )
+
+    raw_columns = ['SNP', 'Z', 'FRQ', 'A1', 'A2', 'N']
+    if _trait_needs_position_columns(args, trait_index):
+        raw_columns.extend(['CHR', 'BP'])
+    raw = data.select(raw_columns)
+
+    qc_columns = ['SNP', 'Z', 'FRQ', 'A1', 'A2', 'P']
+    if args.n_value is None and 'N' in data.columns:
+        qc_columns.append('N')
+    if 'SE' in data.columns:
+        qc_columns.append('SE')
+    conditions = [
+        pl.all_horizontal([
+            pl.col(column).is_not_null() for column in qc_columns
+        ])
+    ]
+    drop_keys = ['NA']
+    if 'INFO' in data.columns:
+        conditions.append(
+            pl.col('INFO') >= args.info_min_list[trait_index]
+        )
+        drop_keys.append('INFO')
+    frequency = pl.col('FRQ')
+    conditions.append(
+        (frequency > 0)
+        & (frequency < 1)
+        & (
+            pl.min_horizontal(frequency, 1 - frequency)
+            > args.maf_min_list[trait_index]
+        )
+    )
+    drop_keys.append('FRQ')
+    if 'SE' in data.columns:
+        conditions.append(pl.col('SE') >= 0)
+        drop_keys.append('SE')
+    conditions.append((pl.col('P') > 0) & (pl.col('P') <= 1))
+    drop_keys.append('P')
+    conditions.append(
+        pl.concat_str(['A1', 'A2']).is_in(
+            list(allele_info.VALID_andSA_SNPS)
+        )
+    )
+    drop_keys.append('A')
+
+    cumulative = conditions[0]
+    cumulative_masks = [cumulative]
+    for condition in conditions[1:]:
+        cumulative = cumulative & condition
+        cumulative_masks.append(cumulative)
+    counts = data.select([
+        mask.sum().alias('filter_{}'.format(index))
+        for index, mask in enumerate(cumulative_masks)
+    ]).row(0)
+    drops = {}
+    previous_count = total_rows
+    for key, count in zip(drop_keys, counts):
+        drops[key] = previous_count - count
+        previous_count = count
+    for key in ['INFO', 'SE']:
+        drops.setdefault(key, 0)
+
+    accepted_before_dedup = counts[-1]
+    accepted = data.filter(cumulative_masks[-1]).unique(
+        subset='SNP', keep='first', maintain_order=True
+    )
+    duplicate_accepted_count = accepted_before_dedup - len(accepted)
+    n_min = args.n_min_list[trait_index]
+    if n_min is None:
+        n_min = accepted.select(
+            pl.col('N').quantile(0.9, interpolation='linear') / 1.5
+        ).item()
+    accepted_before_n = len(accepted)
+    accepted = accepted.filter(pl.col('N') >= n_min)
+
+    logging.info(
+        'Read {} SNPs from --sumstats file.\n'
+        'Removed {} SNPs with missing values.\n'
+        'Removed {} SNPs with INFO <= {}.\n'
+        'Removed {} SNPs with MAF <= {}.\n'
+        'Removed {} SNPs with SE <0 or NaN values.\n'
+        'Removed {} SNPs with out-of-bounds p-values.\n'
+        'Removed {} variants that were not SNPs. Note: strand ambiguous '
+        'SNPs were not dropped.\n'
+        '{} SNPs remain.\n'
+        'Removed {} SNPs with duplicated rs numbers ({} SNPs remain).\n'
+        'Removed {} SNPs with N < {} ({} SNPs remain).'.format(
+            total_rows,
+            drops['NA'],
+            drops['INFO'],
+            args.info_min_list[trait_index],
+            drops['FRQ'],
+            args.maf_min_list[trait_index],
+            drops['SE'],
+            drops['P'],
+            drops['A'],
+            accepted_before_dedup,
+            duplicate_accepted_count,
+            accepted_before_n,
+            accepted_before_n - len(accepted),
+            n_min,
+            len(accepted),
+        )
+    )
+    signed_z = accepted['Z'].to_numpy()
+    logging.info(munge_sumstats.check_median(
+        signed_z, 0.0, args.median_z_cutoff, 'SIGNED_SUMSTAT'
+    ))
+    chi_squared = np.square(signed_z)
+    logging.info(
+        '\nMetadata:\nMean chi^2 = {}\nLambda GC = {}\nMax chi^2 = {}\n'
+        '{} Genome-wide significant SNPs (some may have been removed by '
+        'filtering).'.format(
+            round(np.mean(chi_squared), 3),
+            round(np.median(chi_squared) / 0.4549, 3),
+            round(np.max(chi_squared), 3),
+            int(np.sum(chi_squared > 29)),
+        )
+    )
+
+    raw_membership = raw.join(
+        accepted.select('SNP'),
+        on='SNP',
+        how='semi',
+        maintain_order='left',
+    )
+    z_checker = raw_membership.select(
+        (pl.col('Z') * pl.col('Z')).mean()
+    ).item()
+    membership_count = len(raw_membership)
+    raw = raw_membership.unique(
+        subset='SNP', keep='first', maintain_order=True
+    )
+    duplicate_raw_count = membership_count - len(raw)
+    if duplicate_raw_count > 0:
+        logging.info(
+            'Trait {}: Dropped {} SNPs for duplicate values in the '
+            '"snp_name" column'.format(
+                trait_index + 1, duplicate_raw_count
+            )
+        )
+    logging.info(
+        'Polars loading and munging of Trait {} took {:.3f} seconds.'.format(
+            trait_index + 1, time.time() - start_time
+        )
+    )
+    if return_polars:
+        return raw, total_rows, z_checker
+    return _polars_frame_to_pandas(raw), total_rows, z_checker
+
+
+def _load_and_merge_polars_standard(args, input_files):
+    """Keep standard multi-trait harmonization in Polars until final output."""
+    pl = _polars_module()
+    trait_frames = []
+    for trait_index, file_path in enumerate(input_files):
+        frame, _, z_checker = _load_trait_polars(
+            args, file_path, trait_index, return_polars=True
+        )
+        if z_checker < 1.02 and not args.force:
+            raise ValueError(
+                'The mean chi2 statistic of trait {} is less than 1.02, '
+                'which may lead to unstable estimates. To perform MTAG on '
+                'your results anyways, include the --force option, though '
+                'the estimates should be interpreted cautiously.'.format(
+                    trait_index + 1
+                )
+            )
+        if z_checker < 1.02:
+            logging.info(
+                'Warning: The mean chi2 statistic of trait {} is less 1.02 '
+                '- MTAG estimates may be unstable.'.format(trait_index + 1)
+            )
+        frame = frame.rename({
+            column: '{}{}'.format(column, trait_index)
+            for column in frame.columns
+            if column != 'SNP'
+        })
+        trait_frames.append(frame)
+
+    strand_ambiguous = [
+        pair for pair, is_ambiguous in allele_info.STRAND_AMBIGUOUS.items()
+        if is_ambiguous
+    ]
+    combined = trait_frames[0].with_columns(
+        pl.concat_str(['A10', 'A20'])
+        .is_in(strand_ambiguous)
+        .alias('strand_ambig')
+    )
+    if args.incld_ambig_snps:
+        logging.info(
+            '{} strand ambiguous SNPs in Trait 1 are included.'.format(
+                combined['strand_ambig'].sum()
+            )
+        )
+    else:
+        old_count = len(combined)
+        combined = combined.filter(~pl.col('strand_ambig'))
+        logging.info(
+            'Dropped {} SNPs due to strand ambiguity, {} SNPs remain in '
+            'intersection after merging trait1'.format(
+                old_count - len(combined), len(combined)
+            )
+        )
+
+    for trait_index in range(1, len(trait_frames)):
+        combined = combined.join(
+            trait_frames[trait_index],
+            on='SNP',
+            how='inner',
+            maintain_order='left',
+        )
+        old_count = len(combined)
+        same_order = (
+            (pl.col('A10') == pl.col('A1{}'.format(trait_index)))
+            & (pl.col('A20') == pl.col('A2{}'.format(trait_index)))
+        )
+        flipped_order = (
+            (pl.col('A10') == pl.col('A2{}'.format(trait_index)))
+            & (pl.col('A20') == pl.col('A1{}'.format(trait_index)))
+        )
+        combined = combined.with_columns(
+            flipped_order.alias('flip_snps{}'.format(trait_index))
+        ).filter(same_order | flipped_order)
+        if len(combined) < old_count:
+            logging.info(
+                'Dropped {} SNPs due to inconsistent allele pairs from '
+                'phenotype {}. {} SNPs remain.'.format(
+                    old_count - len(combined),
+                    trait_index + 1,
+                    len(combined),
+                )
+            )
+        flip_column = 'flip_snps{}'.format(trait_index)
+        flip_count = combined[flip_column].sum()
+        if flip_count > 0:
+            a1_column = 'A1{}'.format(trait_index)
+            a2_column = 'A2{}'.format(trait_index)
+            combined = combined.with_columns(
+                pl.when(pl.col(flip_column))
+                .then(-pl.col('Z{}'.format(trait_index)))
+                .otherwise(pl.col('Z{}'.format(trait_index)))
+                .alias('Z{}'.format(trait_index)),
+                pl.when(pl.col(flip_column))
+                .then(1.0 - pl.col('FRQ{}'.format(trait_index)))
+                .otherwise(pl.col('FRQ{}'.format(trait_index)))
+                .alias('FRQ{}'.format(trait_index)),
+                pl.when(pl.col(flip_column))
+                .then(pl.col(a2_column))
+                .otherwise(pl.col(a1_column))
+                .alias(a1_column),
+                pl.when(pl.col(flip_column))
+                .then(pl.col(a1_column))
+                .otherwise(pl.col(a2_column))
+                .alias(a2_column),
+            )
+            logging.info(
+                'Flipped the signs of of {} SNPs to make them consistent '
+                'with the effect allele orderings of the first trait.'.format(
+                    flip_count
+                )
+            )
+
+    if args.only_chr is not None and not args.no_chr_data:
+        chromosomes = args.only_chr.split(',')
+        combined = combined.filter(
+            pl.col('CHR0').cast(pl.String).is_in(chromosomes)
+        )
+    logging.info(
+        '... Merge of GWAS summary statistics complete. Number of SNPs:\t {}'
+        .format(len(combined))
+    )
+    combined = _polars_frame_to_pandas(combined)
+    args.P = len(input_files)
+    return combined, combined, args
+
 def load_and_merge_data(args):
     '''
     Parses file names from MTAG command line arguments and returns the relevant used for method.
@@ -315,25 +1065,65 @@ def load_and_merge_data(args):
         args.n_list = [int(x) for x in args.n_value.split(',')]
         assert P == len(args.n_list), "Mismatch of length of --n_value and number of summary statistics."
 
+    load_backend = getattr(args, 'load_backend', 'polars')
+    if (
+        load_backend == 'polars'
+        and not getattr(args, 'legacy_loader', False)
+        and not all(
+            _is_polars_input_compatible(file_path)
+            for file_path in GWAS_input_files
+        )
+    ):
+        logging.info(
+            'At least one input is not a directly readable tab-delimited '
+            'Polars input; using the fused pandas loader for this analysis.'
+        )
+        load_backend = 'pandas'
+
+    use_polars_standard_path = (
+        load_backend == 'polars'
+        and not getattr(args, 'legacy_loader', False)
+        and not args.use_beta_se
+        and not args.meta_format
+        and args.include is None
+        and args.exclude is None
+    )
+    if use_polars_standard_path:
+        return _load_and_merge_polars_standard(args, GWAS_input_files)
+
     #=====================
     # Reading sumstats
     #=====================
 
     GWAS_d = dict()
     sumstats_format = dict()
+    use_fused_loader = (
+        not getattr(args, 'legacy_loader', False)
+        and not args.use_beta_se
+    )
     for p, GWAS_input in enumerate(GWAS_input_files):
 
-        # read sumstats and add suffix
-        GWAS_d[p], gwas_dat_gen = _read_GWAS_sumstats(GWAS_input, args.chunksize)
-        logging.info('Read in Trait {} summary statistics ({} SNPs) from {} ...'.format(p+1,len(GWAS_d[p]), GWAS_input))
+        if use_fused_loader:
+            if load_backend == 'polars':
+                loaded_trait = _load_trait_polars(args, GWAS_input, p)
+            else:
+                loaded_trait = _load_trait_fast(args, GWAS_input, p)
+            GWAS_d[p], input_row_count, fused_z_checker = loaded_trait
+            sumstats_format[p] = None
+        else:
+            # read sumstats and add suffix
+            GWAS_d[p], gwas_dat_gen = _read_GWAS_sumstats(GWAS_input, args.chunksize)
+            logging.info('Read in Trait {} summary statistics ({} SNPs) from {} ...'.format(p+1,len(GWAS_d[p]), GWAS_input))
 
-        # perform munge sumstats
-        GWAS_d[p], sumstats_format[p] = _perform_munge(args, GWAS_d[p], gwas_dat_gen, p)
+            # perform munge sumstats
+            GWAS_d[p], sumstats_format[p] = _perform_munge(args, GWAS_d[p], gwas_dat_gen, p)
 
         # generate Z checker:
         if args.use_beta_se:
             GWAS_d[p]['Z'] = GWAS_d[p][args.beta_name] / GWAS_d[p][args.se_name]
             z_checker = np.mean(np.square(GWAS_d[p]['Z']))
+        elif use_fused_loader:
+            z_checker = fused_z_checker
         else:
             z_checker = np.mean(np.square(GWAS_d[p][args.z_name]))
 
@@ -345,39 +1135,65 @@ def load_and_merge_data(args):
         else:
             if z_checker < 1.02:
                 logging.info("Warning: The mean chi2 statistic of trait {} is less 1.02 - MTAG estimates may be unstable.".format(p+1))
-            GWAS_d[p].rename(
-                columns=_internal_column_renames(GWAS_d[p].columns, args),
-                inplace=True,
-            )
+            if not use_fused_loader:
+                GWAS_d[p].rename(
+                    columns=_internal_column_renames(GWAS_d[p].columns, args),
+                    inplace=True,
+                )
+
+            if not getattr(args, 'legacy_loader', False):
+                core_columns = ['SNP', 'Z', 'N', 'FRQ', 'A1', 'A2']
+                if _trait_needs_position_columns(args, p):
+                    core_columns.extend(['CHR', 'BP'])
+                if args.use_beta_se:
+                    core_columns.extend(['BETA', 'SE'])
+                missing_core = [
+                    column for column in core_columns
+                    if column not in GWAS_d[p].columns
+                ]
+                if missing_core:
+                    raise ValueError(
+                        'Missing required MTAG columns after input munging: {}'
+                        .format(', '.join(missing_core))
+                    )
+                GWAS_d[p] = GWAS_d[p][core_columns].copy()
+
             GWAS_d[p] = GWAS_d[p].add_suffix(p)
 
         # flag inconsistency change
-        if args.info_min_list[p] is not None and "INFO{}".format(p) not in GWAS_d[p].columns:
+        if (
+            not use_fused_loader
+            and args.info_min_list[p] is not None
+            and "INFO{}".format(p) not in GWAS_d[p].columns
+        ):
             raise IOError("--info_min is specified but info column is not present in sumstats {}".format(p+1))
         if args.maf_min_list[p] is not None and "FRQ{}".format(p) not in GWAS_d[p].columns:
             raise IOError("--maf_min is specified but maf column is not present in sumstats {}".format(p+1))
         if args.n_min_list[p] is not None and "N{}".format(p) not in GWAS_d[p].columns:
             raise IOError("--n_min is specified but n column is not present in sumstats {}".format(p+1))
 
-        # convert Alleles to uppercase
-        for col in [col+str(p) for col in ['A1','A2']]:
-            GWAS_d[p][col] = GWAS_d[p][col].str.upper()
+        # The fused loader has already normalized alleles once while applying
+        # its chunk filters.
+        if not use_fused_loader:
+            for col in [col+str(p) for col in ['A1','A2']]:
+                GWAS_d[p][col] = GWAS_d[p][col].str.upper()
 
         GWAS_d[p] = GWAS_d[p].rename(columns={x+str(p):x for x in GWAS_d[p].columns})
         GWAS_d[p] = GWAS_d[p].rename(columns={'SNP'+str(p):'SNP'})
 
-        # Drop SNPs that are missing
-        missing_snps = GWAS_d[p]['SNP'].isin(['NA','.'])
-        M0 = len(GWAS_d[p])
-        GWAS_d[p] = GWAS_d[p][np.logical_not(missing_snps)]
-        if M0-len(GWAS_d[p]) > 0:
-            logging.info('Trait {}: Dropped {} SNPs for missing values in the "snp_name" column'.format(p+1, M0-len(GWAS_d[p])))
+        if not use_fused_loader:
+            # Drop SNPs that are missing
+            missing_snps = GWAS_d[p]['SNP'].isin(['NA','.'])
+            M0 = len(GWAS_d[p])
+            GWAS_d[p] = GWAS_d[p][np.logical_not(missing_snps)]
+            if M0-len(GWAS_d[p]) > 0:
+                logging.info('Trait {}: Dropped {} SNPs for missing values in the "snp_name" column'.format(p+1, M0-len(GWAS_d[p])))
 
-        # Drop snps that are duplicated
-        M0 = len(GWAS_d[p])
-        GWAS_d[p] = GWAS_d[p].drop_duplicates(subset='SNP', keep='first')
-        if M0-len(GWAS_d[p]) > 0:
-            logging.info('Trait {}: Dropped {} SNPs for duplicate values in the "snp_name" column'.format(p+1, M0-len(GWAS_d[p])))
+            # Drop snps that are duplicated
+            M0 = len(GWAS_d[p])
+            GWAS_d[p] = GWAS_d[p].drop_duplicates(subset='SNP', keep='first')
+            if M0-len(GWAS_d[p]) > 0:
+                logging.info('Trait {}: Dropped {} SNPs for duplicate values in the "snp_name" column'.format(p+1, M0-len(GWAS_d[p])))
 
     #=====================
     # merge sumstats
@@ -422,7 +1238,9 @@ def load_and_merge_data(args):
 
         STRAND_AMBIGUOUS_SET = [x for x in allele_info.STRAND_AMBIGUOUS if allele_info.STRAND_AMBIGUOUS[x]]
 
-        GWAS_int['strand_ambig'] = (GWAS_int['A1'+str(0)].str.upper() + GWAS_int['A2'+str(0)].str.upper()).isin(STRAND_AMBIGUOUS_SET)
+        if p == 0 or getattr(args, 'legacy_loader', False):
+            allele_pairs = GWAS_int['A1'+str(0)] + GWAS_int['A2'+str(0)]
+            GWAS_int['strand_ambig'] = allele_pairs.isin(STRAND_AMBIGUOUS_SET)
 
         if not args.incld_ambig_snps:
             M_0 = len(GWAS_int)
@@ -462,8 +1280,14 @@ def load_and_merge_data(args):
         chr_toInclude = [int(c) for c in chr_toInclude]
         GWAS_all = GWAS_all[GWAS_all['CHR'+str(0)].isin(chr_toInclude)]
 
-    ## conform GWAS_int back to intersection
-    GWAS_int = GWAS_int.merge(GWAS_all[['SNP']],how='inner',on='SNP')
+    ## conform GWAS_int back to intersection when GWAS_all was filtered
+    gwas_all_was_filtered = (
+        args.include is not None
+        or args.exclude is not None
+        or (args.only_chr is not None and not args.no_chr_data)
+    )
+    if getattr(args, 'legacy_loader', False) or gwas_all_was_filtered:
+        GWAS_int = GWAS_int.merge(GWAS_all[['SNP']],how='inner',on='SNP')
 
     ## add information to Namespace
     args.P = P
@@ -964,7 +1788,7 @@ def save_mtag_results(args,results_template,Zs,Ns,Fs,mtag_betas,mtag_se,mtag_fac
         out_df['mtag_z'] = mtag_betas[:,0]/mtag_se[:,0]
         out_df['mtag_pval'] = p_values(out_df['mtag_z'])
         out_path = args.out +'_mtag_meta.txt'
-        out_df.to_csv(out_path,sep='\t', index=False)
+        _write_output_frame(args, out_df, out_path)
 
     else:
         for p in range(P):
@@ -989,7 +1813,7 @@ def save_mtag_results(args,results_template,Zs,Ns,Fs,mtag_betas,mtag_se,mtag_fac
             else:
                 out_path = args.out +'_trait_' + str(p+1) + '.txt'
 
-            out_df.to_csv(out_path,sep='\t', index=False)
+            _write_output_frame(args, out_df, out_path)
 
 def write_summary(args,Zs,Ns,Fs,mtag_betas,mtag_se,mtag_factor):
     '''
@@ -1077,7 +1901,7 @@ def save_mtag_results_U(args, comb_df):
             raise ValueError('--meta_format option was not implemented correctly.')
 
         out_path = args.out +'_trait_' + str(p+1) + '.txt'
-        out_df.to_csv(out_path,sep='\t', index=False, na_rep="NA")
+        _write_output_frame(args, out_df, out_path, na_rep='NA')
 
 ## maxFDR Functions
 create_S = lambda P: np.asarray(list(itertools.product([False,True], repeat=P)))
@@ -1860,6 +2684,7 @@ out_opts = parser.add_argument_group(title="Output formatting", description="Set
 out_opts.add_argument("--out", metavar='DIR/PREFIX', default='./mtag_results', type=str, help='Specify the directory and name prefix to output MTAG results. All mtag results will be prefixed with the corresponding tag. Default is ./mtag_results')
 out_opts.add_argument("--make_full_path", default=False, action="store_true", help="option to make output path specified in -out if it does not exist.")
 out_opts.add_argument("--meta_format", default=False, action="store_true", help="In addition to the typical results file that are restricted to the intersection of SNPs across files, this creates a file of the union of SNPs, with applications of the MTAG estimator restricted to the set of traits for which that SNP is available.")
+out_opts.add_argument('--output_backend', '--output-backend', choices=('pandas', 'polars'), default='polars', help='Results-table writer. The single-threaded Polars backend is the default. Use pandas to preserve historical text formatting, or --legacy-loader for the full historical I/O path.')
 
 input_formatting = parser.add_argument_group(title="Column names of input files", description="These options manually pass the names of the relevant summary statistics columns used by MTAG. It is recommended to pass these names because only narrow searches for these columns are performed in the default cases. Moreover, it is necessary that these input files be readable by ldsc's munge_sumstats command.")
 input_formatting.add_argument("--snp_name", default="snpid", action="store",type=str, help="Name of the single column that provides the unique identifier for SNPs in the GWAS summary statistics across all GWAS results. Default is \"snpid\". This the index that will be used to merge the GWAS summary statistics. Any SNP lists passed to ---include or --exclude should also contain the same name.")
@@ -1926,8 +2751,10 @@ misc.add_argument("--tol", default=1e-6,type=float, help="Set the relative (x) t
 misc.add_argument('--numerical_omega', default=False, action='store_true', help='Option to use the MLE estimator of the genetic VCV matrix, implemented through a numerical routine.')
 misc.add_argument('--verbose', default=False, action='store_true', help='When used, will include output from running ldsc scripts as well additional information (such as optimization routine information.')
 misc.add_argument('--chunksize', default=1e7, type=int, help='Chunksize for reading in data.')
+misc.add_argument('--load_backend', '--load-backend', choices=('pandas', 'polars'), default='polars', help='Summary-statistics loading engine. The single-threaded Rust-backed Polars backend is the default for tab-delimited inputs; arbitrary whitespace inputs fall back to the fused pandas loader.')
 misc.add_argument('--stream_stdout', default=False, action='store_true', help='Will streat mtag processing on console in addition to writing to log file.')
 misc.add_argument('--median_z_cutoff', default=DEFAULT_MEDIAN_Z_THRESHOLD, type=float, help='Maximum allowed median Z-score for sumstats during input QC')
+misc.add_argument('--legacy_loader', '--legacy-loader', default=False, action='store_true', help='Use the original pandas loading, merge, and output path. This is intended as a compatibility fallback and for validating the optimized default I/O path.')
 
 if __name__ == '__main__':
     start_t = time.time()

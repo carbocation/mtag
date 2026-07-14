@@ -4,18 +4,11 @@
 
 ## Getting Started
 
-We recommend installing the [Anaconda python distribution](https://www.anaconda.com/download/) as it includes all of the packages listed below. It also makes updating packages relatively painless with the `conda update` command.
+MTAG requires Python 3.10 or newer. Install its runtime dependencies with:
 
-To run `mtag`, you will need to have Python 2.7 installed with the following packages:
-
-* `numpy (>=1.13.1)`  
-* `scipy`
-* `pandas (>=0.18.1)`
-* `argparse`
-* `bitarray` (for `ldsc`)
-* `joblib`
-
-(Note: if you already have the Python 3 version of the Anaconda distribution installed, then you will need to create and activate a Python 2.7 environment to run `mtag`. See [here](https://conda.io/docs/user-guide/tasks/manage-environments.html#creating-an-environment-with-commands) for details.)
+```bash
+python -m pip install -r requirements.txt
+```
 
 
 `mtag` may be downloaded by cloning this github repository:
@@ -28,6 +21,27 @@ To test that the tool has been successfully installed, type:
 	./mtag.py -h
 
 You should see a list of command-line flags and a description of the program. If an error is thrown instead, then there was some problem with the installation process.
+
+### Faster summary-statistics I/O
+
+The default Rust-backed Polars path keeps input QC, multi-trait intersection,
+and allele harmonization outside Python until the final MTAG matrix is
+assembled. It also writes large result tables substantially faster:
+
+```bash
+python -m pip install -r requirements.txt
+python mtag.py --sumstats trait1.tsv.gz,trait2.tsv.gz --out results/mtag
+```
+
+Polars is single-threaded by default in MTAG so its speedup does not depend on
+additional loader parallelism. Callers can explicitly set
+`POLARS_MAX_THREADS` before starting Python if they want Polars to use a larger
+thread pool. The Polars loader requires a real tab delimiter; arbitrary
+whitespace and bzip2 inputs automatically use the fused pandas loader while
+retaining the faster Polars writer. Add `--legacy-loader` to use the original
+pandas loading, merge, and output behavior end to end. The narrower options
+`--load-backend pandas` and `--output-backend pandas` remain available for
+isolated comparisons.
 
 ### maxFDR
 

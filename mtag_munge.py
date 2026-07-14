@@ -583,8 +583,8 @@ def allele_merge(dat, alleles):
     ii = dat.A1.notnull()
     a1234 = dat.A1[ii] + dat.A2[ii] + dat.MA[ii]
     match = a1234.apply(lambda y: y in allele_info.MATCH_ALLELES)
-    jj = pd.Series(np.zeros(len(dat), dtype=bool))
-    jj[ii] = match
+    jj = pd.Series(False, index=dat.index, dtype=bool)
+    jj.loc[ii] = match.to_numpy(dtype=bool)
     old = ii.sum()
     n_mismatch = (~match).sum()
     if n_mismatch < old:

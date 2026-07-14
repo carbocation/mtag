@@ -161,7 +161,7 @@ def test_batched_mtag_analysis_matches_legacy_equations():
         )
 
 
-def _write_sumstats(path, z_scores, sample_size):
+def _write_sumstats(path, z_scores, sample_size, sep=" "):
     allele_pairs = [
         ("A", "G"),
         ("C", "A"),
@@ -186,7 +186,7 @@ def _write_sumstats(path, z_scores, sample_size):
             "n": np.full(rows, sample_size),
         }
     )
-    data.to_csv(path, sep=" ", index=False)
+    data.to_csv(path, sep=sep, index=False)
 
 
 def test_python3_cli_end_to_end_with_supplied_covariances(tmp_path):
@@ -283,6 +283,162 @@ def test_python3_cli_end_to_end_with_supplied_covariances(tmp_path):
         atol=1.0e-15,
     )
     assert (tmp_path / "results.log").exists()
+
+
+def test_fast_and_legacy_loaders_produce_identical_results(tmp_path):
+    trait_1 = tmp_path / "trait_1.txt"
+    trait_2 = tmp_path / "trait_2.txt"
+    z_1 = np.linspace(-2.0, 1.8, 20)
+    z_2 = np.linspace(-1.5, 2.3, 20)
+    _write_sumstats(trait_1, z_1, 10_000)
+    _write_sumstats(trait_2, z_2, 12_000)
+
+    omega_path = tmp_path / "omega.txt"
+    sigma_path = tmp_path / "sigma.txt"
+    np.savetxt(omega_path, [[0.5, 0.2], [0.2, 0.4]])
+    np.savetxt(sigma_path, [[1.0, 0.1], [0.1, 1.0]])
+
+    common_command = [
+        sys.executable,
+        str(ROOT / "mtag.py"),
+        "--sumstats",
+        f"{trait_1},{trait_2}",
+        "--gencov_path",
+        str(omega_path),
+        "--residcov_path",
+        str(sigma_path),
+        "--force",
+        "--median_z_cutoff",
+        "999",
+        "--n_min",
+        "0",
+        "--maf_min",
+        "0",
+    ]
+    fast_prefix = tmp_path / "fast"
+    legacy_prefix = tmp_path / "legacy"
+    fast = subprocess.run(
+        common_command + ["--out", str(fast_prefix)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    legacy = subprocess.run(
+        common_command + ["--out", str(legacy_prefix), "--legacy-loader"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert fast.returncode == 0, fast.stdout + fast.stderr
+    assert legacy.returncode == 0, legacy.stdout + legacy.stderr
+    for trait_number in (1, 2):
+        fast_output = pd.read_csv(
+            tmp_path / f"fast_trait_{trait_number}.txt", sep=r"\s+"
+        )
+        legacy_output = pd.read_csv(
+            tmp_path / f"legacy_trait_{trait_number}.txt", sep=r"\s+"
+        )
+        pd.testing.assert_frame_equal(fast_output, legacy_output)
+
+
+def test_default_polars_io_matches_legacy_results(tmp_path):
+    trait_1 = tmp_path / "trait_1.tsv"
+    trait_2 = tmp_path / "trait_2.tsv"
+    _write_sumstats(
+        trait_1, np.linspace(-2.0, 1.8, 20), 10_000, sep="\t"
+    )
+    _write_sumstats(
+        trait_2, np.linspace(-1.5, 2.3, 20), 12_000, sep="\t"
+    )
+    omega_path = tmp_path / "omega.txt"
+    sigma_path = tmp_path / "sigma.txt"
+    np.savetxt(omega_path, [[0.5, 0.2], [0.2, 0.4]])
+    np.savetxt(sigma_path, [[1.0, 0.1], [0.1, 1.0]])
+
+    common = [
+        sys.executable,
+        str(ROOT / "mtag.py"),
+        "--sumstats",
+        f"{trait_1},{trait_2}",
+        "--gencov_path",
+        str(omega_path),
+        "--residcov_path",
+        str(sigma_path),
+        "--force",
+        "--median_z_cutoff",
+        "999",
+        "--n_min",
+        "0",
+        "--maf_min",
+        "0",
+    ]
+    polars_prefix = tmp_path / "polars"
+    legacy_prefix = tmp_path / "legacy_polars_reference"
+    polars_result = subprocess.run(
+        common + ["--out", str(polars_prefix)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    legacy_result = subprocess.run(
+        common + ["--out", str(legacy_prefix), "--legacy-loader"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert polars_result.returncode == 0, (
+        polars_result.stdout + polars_result.stderr
+    )
+    assert legacy_result.returncode == 0, (
+        legacy_result.stdout + legacy_result.stderr
+    )
+    for trait_number in (1, 2):
+        polars_output = pd.read_csv(
+            tmp_path / f"polars_trait_{trait_number}.txt", sep=r"\s+"
+        )
+        legacy_output = pd.read_csv(
+            tmp_path / f"legacy_polars_reference_trait_{trait_number}.txt",
+            sep=r"\s+",
+        )
+        pd.testing.assert_frame_equal(
+            polars_output,
+            legacy_output,
+            check_exact=False,
+            rtol=1.0e-12,
+            atol=1.0e-15,
+        )
+
+
+def test_polars_output_handles_mixed_chromosomes_and_missing_values(tmp_path):
+    output_path = tmp_path / "polars_output.tsv"
+    frame = pd.DataFrame(
+        {
+            "SNP": ["rs1", "rs2", "rs3"],
+            "CHR": pd.Series([1, "X", "Y"], dtype=object),
+            "BP": [101, 102, 103],
+            "Z": [1.25, np.nan, -2.5],
+        }
+    )
+
+    mtag._write_output_frame(
+        Namespace(output_backend="polars"),
+        frame,
+        output_path,
+        na_rep="NA",
+    )
+
+    assert output_path.read_text() == (
+        "SNP\tCHR\tBP\tZ\n"
+        "rs1\t1\t101\t1.25\n"
+        "rs2\tX\t102\tNA\n"
+        "rs3\tY\t103\t-2.5\n"
+    )
 
 
 def test_python3_cli_estimates_covariances_from_bundled_ld_scores(tmp_path):
