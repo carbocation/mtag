@@ -390,6 +390,68 @@ def test_exact_branch_search_matches_exhaustive_numba(
     )
 
 
+def test_deterministic_subtree_shards_match_single_worker_exactly():
+    traits = 5
+    intervals = 3
+    omega = np.eye(traits) * 1.0e-5
+    sigma = np.eye(traits)
+    sample_sizes = np.full((1, traits), 100_000.0)
+    prepared = mtag._prepare_fdr_calculation(
+        omega, sigma, sample_sizes, np.ones(1), 5.0e-8
+    )
+
+    expected = mtag_numba.evaluate_automatic_grid_max_branch(
+        intervals, traits, omega, prepared, workers=1
+    )
+    expected_levels = [
+        (level["candidates_per_choice"], level["retained"])
+        for level in expected[3]["levels"]
+    ]
+
+    for workers in (2, 4):
+        actual = mtag_numba.evaluate_automatic_grid_max_branch(
+            intervals, traits, omega, prepared, workers=workers
+        )
+
+        assert actual[2] == expected[2]
+        np.testing.assert_array_equal(actual[0], expected[0])
+        np.testing.assert_array_equal(actual[1], expected[1])
+        assert actual[3]["traversal"] == "depth_first_sharded"
+        assert actual[3]["subtree_workers_requested"] == workers
+        assert 1 < actual[3]["subtree_workers_used"] <= workers
+        assert actual[3]["subtree_shards"] >= workers
+        assert [
+            (level["candidates_per_choice"], level["retained"])
+            for level in actual[3]["levels"]
+        ] == expected_levels
+
+
+def test_subtree_worker_exception_is_propagated(monkeypatch):
+    frontier = mtag_numba.SparseBranchTables(
+        np.zeros((2, 1), dtype=np.uint64),
+        np.ones((2, 1), dtype=np.int64),
+        np.ones(2, dtype=np.int64),
+        np.ones((2, 1), dtype=np.int64),
+        np.ones((2, 1, 1), dtype=np.float64),
+        np.ones(2, dtype=np.uint8),
+    )
+
+    def fail_nonempty(shard, _traits, _arguments):
+        if len(shard) == 0:
+            return None
+        raise RuntimeError("shard failed")
+
+    monkeypatch.setattr(
+        mtag_numba,
+        "_evaluate_sparse_branch_frontier",
+        fail_nonempty,
+    )
+    with pytest.raises(RuntimeError, match="shard failed"):
+        mtag_numba._run_sparse_branch_shards(
+            frontier, 1, (), workers=2
+        )
+
+
 def test_simd_branch_power_layout_matches_multiple_n_bins():
     traits = 4
     intervals = 3
@@ -496,9 +558,11 @@ def test_sparse_branch_spike_slab_restriction_matches_exhaustive():
         omega,
         prepared,
         pi_causal_ss=pi_causal,
+        workers=3,
     )
 
     assert actual[2] == expected[2]
+    assert actual[3]["subtree_workers_used"] > 1
     np.testing.assert_array_equal(actual[0], expected[0])
     np.testing.assert_array_equal(actual[1], expected[1])
 
@@ -1049,6 +1113,7 @@ def test_optimized_cli_paths_are_defaults_and_legacy_is_explicit():
     assert defaults.fdr_backend == "numba"
     assert defaults.fdr_search == "auto"
     assert defaults.n_approx
+    assert defaults.cores is None
     assert not defaults.fdr_write_full_grid
     assert not defaults.legacy_loader
 
@@ -1057,6 +1122,30 @@ def test_optimized_cli_paths_are_defaults_and_legacy_is_explicit():
     )
     assert compatibility.legacy_loader
     assert compatibility.fdr_backend == "python"
+
+    assert mtag.parser.parse_args(["--cores", "auto"]).cores is None
+    assert mtag.parser.parse_args(["--cores", "3"]).cores == 3
+
+
+def test_automatic_core_selection_respects_allocation_limits(
+    monkeypatch,
+):
+    for variable in mtag.CPU_ALLOCATION_ENV_VARS:
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setattr(mtag.os, "cpu_count", lambda: 16)
+    monkeypatch.setattr(
+        mtag.os,
+        "sched_getaffinity",
+        lambda _pid: set(range(8)),
+        raising=False,
+    )
+    monkeypatch.setenv("SLURM_CPUS_PER_TASK", "6")
+    monkeypatch.setenv("NUMBA_NUM_THREADS", "4")
+
+    assert mtag._available_cpu_workers() == 4
+    assert mtag._resolve_fdr_cores(None) == 4
+    assert mtag._resolve_fdr_cores(3) == 3
+    assert mtag._resolve_fdr_cores(20) == 4
 
 
 def test_default_skip_mtag_uses_exact_numba_auto_search(tmp_path):
@@ -1083,6 +1172,8 @@ def test_default_skip_mtag_uses_exact_numba_auto_search(tmp_path):
             str(output_prefix),
             "--intervals",
             "2",
+            "--cores",
+            "2",
         ],
         cwd=tmp_path,
         capture_output=True,
@@ -1096,3 +1187,4 @@ def test_default_skip_mtag_uses_exact_numba_auto_search(tmp_path):
     assert not (tmp_path / "default-fast_fdr_mat.txt").exists()
     log = (tmp_path / "default-fast.FDR.log").read_text()
     assert "Exact branch-and-prune maxFDR search" in log
+    assert "Deterministic subtree traversal used 2 workers" in log

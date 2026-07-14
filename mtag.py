@@ -55,9 +55,82 @@ np.set_printoptions(linewidth=800)
 np.set_printoptions(precision=3)
 
 DEFAULT_MEDIAN_Z_THRESHOLD = 0.1
+CPU_ALLOCATION_ENV_VARS = (
+    'SLURM_CPUS_PER_TASK',
+    'PBS_NP',
+    'NSLOTS',
+    'LSB_DJOB_NUMPROC',
+    'NUMBA_NUM_THREADS',
+)
 
 
 ## General helper functions
+def _parse_cores(value):
+    """Accept a positive worker count or the user-friendly auto value."""
+    if str(value).lower() == 'auto':
+        return None
+    try:
+        cores = int(value)
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError(
+            '--cores must be a positive integer or auto'
+        ) from error
+    if cores <= 0:
+        raise argparse.ArgumentTypeError(
+            '--cores must be a positive integer or auto'
+        )
+    return cores
+
+
+def _available_cpu_workers():
+    """Return the most restrictive visible CPU-allocation limit."""
+    limits = []
+    cpu_count = os.cpu_count()
+    if cpu_count is not None and cpu_count > 0:
+        limits.append(int(cpu_count))
+    try:
+        affinity_count = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        affinity_count = 0
+    if affinity_count > 0:
+        limits.append(int(affinity_count))
+    for variable in CPU_ALLOCATION_ENV_VARS:
+        raw_value = os.environ.get(variable)
+        if raw_value is None:
+            continue
+        try:
+            environment_limit = int(raw_value)
+        except ValueError:
+            continue
+        if environment_limit > 0:
+            limits.append(environment_limit)
+    return max(1, min(limits)) if limits else 1
+
+
+def _resolve_fdr_cores(requested_cores):
+    """Choose a safe worker budget without requiring CPU knowledge."""
+    available_cores = _available_cpu_workers()
+    if requested_cores is None:
+        logging.info(
+            'Automatically selected {} maxFDR workers from the CPU '
+            'allocation visible to this process.'.format(available_cores)
+        )
+        return available_cores
+    if requested_cores <= 0:
+        raise ValueError(
+            'number of cores for the max FDR calculation must be positive'
+        )
+    if requested_cores > available_cores:
+        logging.warning(
+            'Requested {} maxFDR cores, but this process can use at most {}; '
+            'using {}.'.format(
+                requested_cores, available_cores, available_cores
+            )
+        )
+        return available_cores
+    return int(requested_cores)
+
+
 def safely_create_folder(folder_path):
     try:
         os.makedirs(folder_path)
@@ -2689,6 +2762,7 @@ def _run_numba_fdr_grid(args, num_traits, prepared, pi_causal_ss):
                 args.omega_hat,
                 prepared,
                 pi_causal_ss=pi_causal_ss,
+                workers=thread_count,
             )
         except mtag_numba.BranchSearchLimitExceeded as error:
             if requested_search == 'branch' or total_points > 100_000_000:
@@ -2748,6 +2822,16 @@ def _run_numba_fdr_grid(args, num_traits, prepared, pi_causal_ss):
                     diagnostics['final_pruned_leaves'], feasible_count
                 )
             )
+            if diagnostics['subtree_workers_used'] > 1:
+                logging.info(
+                    'Deterministic subtree traversal used {} workers across '
+                    '{} shards from a {:,}-row, {}-trait frontier.'.format(
+                        diagnostics['subtree_workers_used'],
+                        diagnostics['subtree_shards'],
+                        diagnostics['subtree_frontier_rows'],
+                        diagnostics['subtree_frontier_traits'],
+                    )
+                )
             return max_fdr, maximizing_probabilities, feasible_count
 
     logging.info(
@@ -2849,8 +2933,7 @@ def fdr(args, Ns_f, Zs, n_approx_precomputed=False):
 
     if args.intervals <= 0:
         raise ValueError('spacing of grid points for the max FDR calculation must be a positive integer')
-    if args.cores <= 0:
-        raise ValueError('number of cores for the max FDR calculation must be positive')
+    args.cores = _resolve_fdr_cores(getattr(args, 'cores', None))
     if not 0.0 < args.p_sig < 1.0:
         raise ValueError('maxFDR significance threshold must be strictly between 0 and 1')
 
@@ -3292,7 +3375,7 @@ fdr_opts.add_argument('--skip_mtag', default=False, action='store_true', help='S
 fdr_opts.add_argument('--grid_file',default=None, action='store', help='Pre-set list of grid points. Users can define a list of grid points over which the search is conducted. The list of grid points should be passed in text file as a white-space delimited matrix of dimnesions, G x S, where G is the number of grid points and S = 2^T is the number of possible causal states for SNPs. States are ordered according to a tree-like recursive structure from right to left. For example, for 3 traits, with the triple TFT denoting the state for which SNPs are causal for State 1, not causal for state 2, and causal for state 3, then the column ordering of probabilities should be: \nFFF FFT FTF FTT TFF TFT TTF TTT\n There should be no headers, or row names in the file. Any rows for which (i) the probabilities do not sum to 1, the prior of a SNP being is causal is 0 for any of the traits, and (iii) the resulting genetic correlation matrix is non positive definite will excluded in the search.')
 fdr_opts.add_argument('--fit_ss', default=False, action='store_true', help='This estimates the prior probability that a SNP is null for each trait and then proceeds to restrict the grid search to the set of probability vectors that sum to the prior null for each trait. This is useful for restrict the search space of larger-dimensional traits.')
 fdr_opts.add_argument('--intervals', default=10, action='store',type=int, help='Number of intervals that you would like to partition the [0,1] interval. For example example, with two traits and --intervals set 10, then maxFDR will calculated over the set of feasible points in {0., 0.1, 0.2,..,0.9,1.0}^2.')
-fdr_opts.add_argument('--cores', default=1, action='store', type=int, help='Number of threads/cores use to compute the FDR grid points for each trait.')
+fdr_opts.add_argument('--cores', default=None, action='store', type=_parse_cores, help='Number of workers used by maxFDR. The default, auto, respects CPU affinity and common scheduler allocation variables. Use --cores 1 for single-worker execution or --cores N to set an explicit budget.')
 fdr_opts.add_argument('--p_sig', default=5.0e-8, type=float, action='store', help='P-value threshold used for statistical signifiance. Default is p=5.0e-8 (genome-wide significance).' )
 fdr_opts.add_argument('--n_approx', default=True, dest='n_approx', action='store_true', help='Speed up FDR calculation by replacing the sample size of a SNP for each trait by the mean across SNPs (for each trait). Recommended and enabled by default.')
 fdr_opts.add_argument('--no_n_approx', '--no-n-approx', dest='n_approx', action='store_false', help='Use each distinct row of SNP sample sizes in the maxFDR power calculation instead of trait means.')

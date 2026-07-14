@@ -1,5 +1,6 @@
 """Optional Numba kernels for fused automatic maxFDR grid evaluation."""
 
+import concurrent.futures
 import itertools
 import math
 
@@ -2134,7 +2135,7 @@ def _evaluate_one_streamed_leaf(
     return True, pair_hit, power_hits, power_misses
 
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def _depth_first_sparse_branch_kernel(
     seed_ids,
     seed_counts,
@@ -2429,6 +2430,226 @@ def _depth_first_sparse_branch_kernel(
     )
 
 
+def _take_sparse_branch_rows(tables, row_indices):
+    """Copy deterministic frontier rows into one independent shard."""
+    return SparseBranchTables(
+        np.ascontiguousarray(tables.state_ids[row_indices]),
+        np.ascontiguousarray(tables.counts[row_indices]),
+        np.ascontiguousarray(tables.occupied[row_indices]),
+        np.ascontiguousarray(tables.pair_counts[row_indices]),
+        np.ascontiguousarray(tables.cholesky[row_indices]),
+        np.ascontiguousarray(tables.factor_valid[row_indices]),
+    )
+
+
+def _evaluate_sparse_branch_frontier(
+    frontier, frontier_traits, common_arguments
+):
+    return _depth_first_sparse_branch_kernel(
+        frontier.state_ids,
+        frontier.counts,
+        frontier.occupied,
+        frontier.pair_counts,
+        frontier.cholesky,
+        frontier.factor_valid,
+        int(frontier_traits),
+        *common_arguments,
+    )
+
+
+def _run_sparse_branch_shards(
+    frontier, frontier_traits, common_arguments, workers
+):
+    """Run stable round-robin frontier shards with bounded threads."""
+    requested_workers = max(1, int(workers))
+    if requested_workers == 1 or len(frontier) <= 1:
+        return (
+            [
+                _evaluate_sparse_branch_frontier(
+                    frontier, frontier_traits, common_arguments
+                )
+            ],
+            1,
+            1,
+        )
+
+    workers_used = min(requested_workers, len(frontier))
+    shard_count = min(len(frontier), workers_used * 4)
+    shards = [
+        _take_sparse_branch_rows(
+            frontier,
+            np.arange(shard_number, len(frontier), shard_count),
+        )
+        for shard_number in range(shard_count)
+    ]
+
+    # Load or compile the Numba signature on the caller thread before the
+    # same no-GIL kernel is entered concurrently by worker threads.
+    empty_frontier = _take_sparse_branch_rows(
+        frontier, np.empty(0, dtype=np.int64)
+    )
+    _evaluate_sparse_branch_frontier(
+        empty_frontier, frontier_traits, common_arguments
+    )
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=workers_used,
+        thread_name_prefix="mtag-maxfdr",
+    ) as executor:
+        futures = [
+            executor.submit(
+                _evaluate_sparse_branch_frontier,
+                shard,
+                frontier_traits,
+                common_arguments,
+            )
+            for shard in shards
+        ]
+        # Consume in shard order so exception and reduction behavior are
+        # deterministic even though execution order is intentionally free.
+        results = [future.result() for future in futures]
+    return results, workers_used, shard_count
+
+
+def _sparse_result_precedes(
+    first_ids,
+    first_counts,
+    first_occupied,
+    second_ids,
+    second_counts,
+    second_occupied,
+):
+    """Python equivalent of the exact in-kernel tie-breaking order."""
+    first_index = 0
+    second_index = 0
+    while first_index < first_occupied or second_index < second_occupied:
+        if (
+            second_index >= second_occupied
+            or (
+                first_index < first_occupied
+                and first_ids[first_index] < second_ids[second_index]
+            )
+        ):
+            first_count = first_counts[first_index]
+            second_count = 0
+            first_index += 1
+        elif (
+            first_index >= first_occupied
+            or second_ids[second_index] < first_ids[first_index]
+        ):
+            first_count = 0
+            second_count = second_counts[second_index]
+            second_index += 1
+        else:
+            first_count = first_counts[first_index]
+            second_count = second_counts[second_index]
+            first_index += 1
+            second_index += 1
+        if first_count != second_count:
+            return first_count < second_count
+    return False
+
+
+def _combine_sparse_branch_results(
+    results,
+    num_traits,
+    intervals,
+    level_visited=None,
+    level_retained=None,
+    fast_accepts=None,
+    fast_rejects=None,
+    eigen_fallbacks=None,
+):
+    """Reduce shards exactly, including historical equal-value ties."""
+    max_fdr = np.full(num_traits, -np.inf, dtype=np.float64)
+    best_ids = np.zeros((num_traits, intervals), dtype=np.uint64)
+    best_counts = np.zeros((num_traits, intervals), dtype=np.int64)
+    best_occupied = np.zeros(num_traits, dtype=np.int64)
+    if level_visited is None:
+        level_visited = np.zeros(num_traits, dtype=np.int64)
+        level_retained = np.zeros(num_traits, dtype=np.int64)
+        fast_accepts = np.zeros(num_traits, dtype=np.int64)
+        fast_rejects = np.zeros(num_traits, dtype=np.int64)
+        eigen_fallbacks = np.zeros(num_traits, dtype=np.int64)
+
+    feasible_count = 0
+    invalid = False
+    pair_hits = 0
+    pair_misses = 0
+    power_hits = 0
+    power_misses = 0
+    for result in results:
+        (
+            shard_max,
+            shard_ids,
+            shard_counts,
+            shard_occupied,
+            shard_feasible,
+            shard_invalid,
+            shard_visited,
+            shard_retained,
+            shard_fast_accepts,
+            shard_fast_rejects,
+            shard_eigen_fallbacks,
+            shard_pair_hits,
+            shard_pair_misses,
+            shard_power_hits,
+            shard_power_misses,
+        ) = result
+        feasible_count += int(shard_feasible)
+        invalid = invalid or bool(shard_invalid)
+        level_visited += shard_visited
+        level_retained += shard_retained
+        fast_accepts += shard_fast_accepts
+        fast_rejects += shard_fast_rejects
+        eigen_fallbacks += shard_eigen_fallbacks
+        pair_hits += int(shard_pair_hits)
+        pair_misses += int(shard_pair_misses)
+        power_hits += int(shard_power_hits)
+        power_misses += int(shard_power_misses)
+
+        for trait in range(num_traits):
+            value = shard_max[trait]
+            occupied = int(shard_occupied[trait])
+            if (
+                value > max_fdr[trait]
+                or (
+                    value == max_fdr[trait]
+                    and _sparse_result_precedes(
+                        shard_ids[trait],
+                        shard_counts[trait],
+                        occupied,
+                        best_ids[trait],
+                        best_counts[trait],
+                        int(best_occupied[trait]),
+                    )
+                )
+            ):
+                max_fdr[trait] = value
+                best_ids[trait, :occupied] = shard_ids[trait, :occupied]
+                best_counts[trait, :occupied] = shard_counts[
+                    trait, :occupied
+                ]
+                best_occupied[trait] = occupied
+
+    return (
+        max_fdr,
+        best_ids,
+        best_counts,
+        best_occupied,
+        feasible_count,
+        invalid,
+        level_visited,
+        level_retained,
+        fast_accepts,
+        fast_rejects,
+        eigen_fallbacks,
+        pair_hits,
+        pair_misses,
+        power_hits,
+        power_misses,
+    )
+
+
 def _materialize_sparse_probability_rows(
     state_ids,
     counts,
@@ -2458,10 +2679,13 @@ def evaluate_automatic_grid_max_branch(
     extension_trial_limit=16,
     pair_cache_size=256,
     power_cache_size=1,
+    workers=1,
 ):
     """Exactly maximize maxFDR with depth-first sparse branch pruning."""
     if intervals <= 0:
         raise ValueError("maxFDR intervals must be positive")
+    if int(workers) <= 0:
+        raise ValueError("branch workers must be positive")
     omega = np.asarray(omega, dtype=np.float64)
     if np.isscalar(causal_states):
         num_traits = int(causal_states)
@@ -2572,8 +2796,7 @@ def evaluate_automatic_grid_max_branch(
     # Pick one fixed remaining order before traversal.  Trying a different
     # order cannot change the exact feasible set; strong correlations first
     # merely tend to expose violated principal constraints at shallower
-    # depths.  Unlike the old breadth-first implementation, no candidate
-    # frontier is materialized to compare alternative orders.
+    # depths.
     order = list(best_order)
     remaining = [trait for trait in range(num_traits) if trait not in order]
     while remaining:
@@ -2627,30 +2850,55 @@ def evaluate_automatic_grid_max_branch(
         1,
         min(int(power_cache_size), cache_budget // power_entry_bytes),
     )
-    (
-        max_fdr,
-        best_ids,
-        best_counts,
-        best_occupied,
-        feasible_count,
-        invalid,
-        level_visited,
-        level_retained,
-        fast_accepts,
-        fast_rejects,
-        eigen_fallbacks,
-        pair_hits,
-        pair_misses,
-        power_hits,
-        power_misses,
-    ) = _depth_first_sparse_branch_kernel(
-        best_seed.state_ids,
-        best_seed.counts,
-        best_seed.occupied,
-        best_seed.pair_counts,
-        best_seed.cholesky,
-        best_seed.factor_valid,
-        int(seed_traits),
+    prefix_level_visited = np.zeros(num_traits, dtype=np.int64)
+    prefix_level_retained = np.zeros(num_traits, dtype=np.int64)
+    prefix_fast_accepts = np.zeros(num_traits, dtype=np.int64)
+    prefix_fast_rejects = np.zeros(num_traits, dtype=np.int64)
+    prefix_eigen_fallbacks = np.zeros(num_traits, dtype=np.int64)
+    frontier = best_seed
+    frontier_traits = seed_traits
+    target_frontier_rows = max(1, int(workers) * 16)
+    while (
+        int(workers) > 1
+        and frontier_traits < num_traits
+        and len(frontier) < target_frontier_rows
+    ):
+        maximum_children = sparse_branch_extension_count(frontier)
+        child_traits = frontier_traits + 1
+        child_row_bytes = _sparse_table_bytes_per_row(
+            intervals, child_traits
+        )
+        if maximum_children * child_row_bytes * 2 > table_byte_limit:
+            break
+        child_omega = ordered_omega[:child_traits, :child_traits]
+        child_pi = (
+            None
+            if not fit_ss
+            else ordered_pi[:child_traits]
+        )
+        frontier, extension_diagnostics = expand_sparse_branch_tables(
+            frontier,
+            intervals,
+            child_omega,
+            prune_tolerance,
+            pi_causal_ss=child_pi,
+        )
+        (
+            visited,
+            accepted,
+            rejected,
+            fallbacks,
+        ) = extension_diagnostics
+        prefix_level_visited[frontier_traits] = visited
+        prefix_level_retained[frontier_traits] = len(frontier)
+        prefix_fast_accepts[frontier_traits] = accepted
+        prefix_fast_rejects[frontier_traits] = rejected
+        prefix_eigen_fallbacks[frontier_traits] = fallbacks
+        frontier_traits = child_traits
+        if len(frontier) == 0:
+            break
+
+    common_arguments = (
         order_array,
         int(intervals),
         ordered_omega,
@@ -2668,6 +2916,38 @@ def evaluate_automatic_grid_max_branch(
         final_pi,
         int(actual_pair_cache_size),
         int(actual_power_cache_size),
+    )
+    shard_results, workers_used, shard_count = _run_sparse_branch_shards(
+        frontier,
+        frontier_traits,
+        common_arguments,
+        workers,
+    )
+    (
+        max_fdr,
+        best_ids,
+        best_counts,
+        best_occupied,
+        feasible_count,
+        invalid,
+        level_visited,
+        level_retained,
+        fast_accepts,
+        fast_rejects,
+        eigen_fallbacks,
+        pair_hits,
+        pair_misses,
+        power_hits,
+        power_misses,
+    ) = _combine_sparse_branch_results(
+        shard_results,
+        num_traits,
+        intervals,
+        level_visited=prefix_level_visited,
+        level_retained=prefix_level_retained,
+        fast_accepts=prefix_fast_accepts,
+        fast_rejects=prefix_fast_rejects,
+        eigen_fallbacks=prefix_eigen_fallbacks,
     )
     if invalid:
         raise ValueError(
@@ -2717,8 +2997,15 @@ def evaluate_automatic_grid_max_branch(
         "levels": level_diagnostics,
         "final_pruned_leaves": int(feasible_count),
         "representation": "sparse",
-        "traversal": "depth_first",
-        "frontier_rows_materialized": int(len(best_seed)),
+        "traversal": (
+            "depth_first_sharded" if workers_used > 1 else "depth_first"
+        ),
+        "frontier_rows_materialized": int(len(frontier)),
+        "subtree_workers_requested": int(workers),
+        "subtree_workers_used": int(workers_used),
+        "subtree_shards": int(shard_count),
+        "subtree_frontier_traits": int(frontier_traits),
+        "subtree_frontier_rows": int(len(frontier)),
         "maximum_occupied_states": int(intervals),
         "pair_signature_cache_size": int(actual_pair_cache_size),
         "pair_signature_cache_hits": int(pair_hits),
