@@ -52,6 +52,22 @@ python mtag.py --skip_mtag --out results/mtag --intervals 10
 and `--no-n-approx` uses distinct SNP sample-size rows instead of the default
 trait-wise mean approximation.
 
+Large automatically generated grids can use the optional fused Numba engine:
+
+```bash
+python -m pip install -r requirements-numba.txt
+python mtag.py --sumstats trait1.txt,trait2.txt --out results/mtag \
+  --fdr --intervals 10 --fdr-backend numba --cores 8
+```
+
+The Numba engine generates and evaluates the automatic grid in chunks while
+preserving grid order and maxFDR calculations; its first invocation includes a
+one-time compilation cost. `--fdr-chunk-size` controls the candidate working set
+(default 100,000). Feasible rows are still retained and written to the
+probability-grid and FDR output files for feature parity, so this setting does
+not bound the size of those final results. Custom `--grid_file` inputs currently
+require `--fdr-backend python`.
+
 A tutorial that walks through an example use of `mtag` may be found in the wiki.
 
 ### Updating `mtag`
@@ -92,4 +108,3 @@ Patrick Turley (Broad Institute of MIT and Harvard)
 ### Acknowledgments
 
 The development of this software was carried out under the auspices of the Social Science Genetic Association Consortium (SSGAC). This work was supported by the Ragnar Söderberg Foundation (E9/11 E42/15), the Swedish Research Council (421-2013-1061), The Jan Wallander and Tom Hedelius Foundation, an ERC Consolidator Grant (647648 EdGe), the Pershing Square Fund of the Foundations of Human Behavior, the National Science Foundation’s Graduate Research Fellowship Program (DGE 1144083), and the NIA/NIH through grants P01-AG005842, P01-AG005842-20S2, P30-AG012810, and T32-AG000186-23 to NBER, R01-AG042568-02 to the University of Southern California, and 1R01MH107649-01and 1R01MH101244-02 to the Broad Institute at Harvard and MIT. 
-

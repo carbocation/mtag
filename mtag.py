@@ -1313,6 +1313,59 @@ def _FDR_par(func_args):
     probs, omega_hat, S, prepared, g = func_args
     return _compute_fdr_values(probs, omega_hat, S, prepared), g
 
+
+def _run_numba_fdr_grid(args, causal_states, prepared, pi_causal_ss):
+    """Run the optional fused Numba automatic-grid maxFDR engine."""
+    try:
+        import numba
+        import mtag_numba
+    except ImportError as error:
+        raise RuntimeError(
+            '--fdr_backend numba requires the optional Numba dependencies; '
+            'install requirements-numba.txt'
+        ) from error
+
+    available_threads = numba.config.NUMBA_DEFAULT_NUM_THREADS
+    thread_count = min(args.cores, available_threads)
+    if thread_count != args.cores:
+        logging.warning(
+            'Requested {} maxFDR cores, but Numba supports at most {} in '
+            'this process; using {}.'.format(
+                args.cores, available_threads, thread_count
+            )
+        )
+    numba.set_num_threads(thread_count)
+    total_points = mtag_numba.automatic_grid_size(
+        len(causal_states), args.intervals
+    )
+    logging.info(
+        'Fused Numba maxFDR engine will generate and evaluate {:,} candidate '
+        'grid points using {} threads.'.format(total_points, thread_count)
+    )
+    start_fdr = time.time()
+    next_progress = [10]
+
+    def report_progress(completed, total):
+        percentage = int(100.0 * completed / total)
+        while next_progress[0] <= 100 and percentage >= next_progress[0]:
+            logging.info(
+                'Grid search: {} percent finished. Time: \t{:.3f} min'.format(
+                    next_progress[0], (time.time() - start_fdr) / 60.0
+                )
+            )
+            next_progress[0] += 10
+
+    return mtag_numba.evaluate_automatic_grid(
+        args.intervals,
+        causal_states,
+        args.omega_hat,
+        prepared,
+        pi_causal_ss=pi_causal_ss,
+        chunk_size=getattr(args, 'fdr_chunk_size', 100000),
+        progress_callback=report_progress,
+    )
+
+
 def fdr(args, Ns_f, Zs):
     '''
     Ns: Mx T matrix of sample sizes
@@ -1365,44 +1418,6 @@ def fdr(args, Ns_f, Zs):
         for t in range(T):
             logging.info('Trait {}: \t {:.3f}'.format(t, pi_causal_ss[t]))
 
-    if args.grid_file is not None:
-        candidate_grid = load_probability_grid(args.grid_file, len(S))
-    else:
-        # automate the creation of the probability grid
-        # one_dim_interval = np.linspace(0., 1., args.intervals +1)
-        candidate_grid = simplex_walk(len(S)-1, args.intervals+1)
-    # exclude probabilities that have at least one trait with zero pi_causal
-    # exclude probabilities that don't yield a valid NPD matrix
-    prob_grid = []
-    for probabilities in candidate_grid:
-        pair_probabilities = _causal_pair_probabilities(probabilities, S)
-        if not np.all(pair_probabilities > 0.0):
-            continue
-        if pi_causal_ss is not None and not np.all(
-            np.abs(causal_prob(probabilities, S) - pi_causal_ss)
-            < (1.0 / args.intervals)
-        ):
-            continue
-        if is_pos_semidef(args.omega_hat / pair_probabilities):
-            prob_grid.append(probabilities)
-
-    if pi_causal_ss is not None:
-        logging.info('{} probabilities remain after restricting to the grid points with causal probabilities less than one unit (i.e. 1/intervals) from the Spike-Slab fitted causal probabilities.'.format(len(prob_grid)))
-
-    if len(prob_grid) == 0:
-        raise ValueError(
-            'No feasible maxFDR grid points remain after applying causal-state '
-            'and covariance constraints'
-        )
-    prob_grid = np.asarray(prob_grid, dtype=float)
-
-    logging.info('Number of gridpoints to search: {}'.format(len(prob_grid)))
-
-    FDR = np.full((len(prob_grid), T), np.nan)
-
-    # performing coarse grid search
-    logging.info('Performing grid search using {} cores.'.format(args.cores))
-
     if args.n_approx:
         N_vals = np.mean(Ns, axis=0, keepdims=True)
         N_weights = np.ones(1)
@@ -1415,42 +1430,97 @@ def fdr(args, Ns_f, Zs):
     prepared = _prepare_fdr_calculation(
         args.omega_hat, args.sigma_hat, N_vals, N_weights, args.p_sig
     )
-    NN = len(prob_grid)
-    K = min(10, NN)
-    start_fdr =time.time()
-    np.savetxt(args.out + '_prob_grid.txt', prob_grid, delimiter='\t')
-
-    def run_grid_search(parallel=None):
-        for k in range(K):
-            k0 = int(k*NN / K)
-            k1 = int((k+1) * NN / K)
-            task_arguments = (
-                (prob_grid[g], args.omega_hat, S, prepared, g)
-                for g in range(k0, k1)
+    fdr_backend = getattr(args, 'fdr_backend', 'python')
+    if fdr_backend == 'numba':
+        if args.grid_file is not None:
+            raise ValueError(
+                '--fdr_backend numba currently supports the automatic grid '
+                'only; omit --grid_file or use --fdr_backend python'
             )
-            if parallel is None:
-                grid_results = [_FDR_par(f_args) for f_args in task_arguments]
-            else:
-                grid_results = parallel(
-                    joblib.delayed(_FDR_par)(f_args)
-                    for f_args in task_arguments
-                )
-            logging.info('Grid search: {} percent finished. Time: \t{:.3f} min'.format((k+1)*100./K, (time.time()-start_fdr)/ 60.))
-            for fdr_values, grid_index in grid_results:
-                FDR[grid_index, :] = fdr_values
-
-            np.savetxt(args.out + '_fdr_mat.txt', FDR, delimiter='\t')
-
-    if args.cores == 1:
-        run_grid_search()
+        prob_grid, FDR = _run_numba_fdr_grid(
+            args, S, prepared, pi_causal_ss
+        )
+        if len(prob_grid) == 0:
+            raise ValueError(
+                'No feasible maxFDR grid points remain after applying '
+                'causal-state and covariance constraints'
+            )
+        if pi_causal_ss is not None:
+            logging.info('{} probabilities remain after restricting to the grid points with causal probabilities less than one unit (i.e. 1/intervals) from the Spike-Slab fitted causal probabilities.'.format(len(prob_grid)))
+        logging.info('Number of gridpoints searched: {}'.format(len(prob_grid)))
+        np.savetxt(args.out + '_prob_grid.txt', prob_grid, delimiter='\t')
     else:
-        with joblib.Parallel(
-            n_jobs=args.cores,
-            backend='multiprocessing',
-            verbose=0,
-            batch_size='auto',
-        ) as parallel:
-            run_grid_search(parallel)
+        if args.grid_file is not None:
+            candidate_grid = load_probability_grid(args.grid_file, len(S))
+        else:
+            # automate the creation of the probability grid
+            candidate_grid = simplex_walk(len(S)-1, args.intervals+1)
+        # exclude probabilities that have at least one trait with zero pi_causal
+        # exclude probabilities that don't yield a valid NPD matrix
+        prob_grid = []
+        for probabilities in candidate_grid:
+            pair_probabilities = _causal_pair_probabilities(probabilities, S)
+            if not np.all(pair_probabilities > 0.0):
+                continue
+            if pi_causal_ss is not None and not np.all(
+                np.abs(causal_prob(probabilities, S) - pi_causal_ss)
+                < (1.0 / args.intervals)
+            ):
+                continue
+            if is_pos_semidef(args.omega_hat / pair_probabilities):
+                prob_grid.append(probabilities)
+
+        if pi_causal_ss is not None:
+            logging.info('{} probabilities remain after restricting to the grid points with causal probabilities less than one unit (i.e. 1/intervals) from the Spike-Slab fitted causal probabilities.'.format(len(prob_grid)))
+
+        if len(prob_grid) == 0:
+            raise ValueError(
+                'No feasible maxFDR grid points remain after applying causal-state '
+                'and covariance constraints'
+            )
+        prob_grid = np.asarray(prob_grid, dtype=float)
+
+        logging.info('Number of gridpoints to search: {}'.format(len(prob_grid)))
+        FDR = np.full((len(prob_grid), T), np.nan)
+        logging.info('Performing grid search using {} cores.'.format(args.cores))
+        NN = len(prob_grid)
+        K = min(10, NN)
+        start_fdr =time.time()
+        np.savetxt(args.out + '_prob_grid.txt', prob_grid, delimiter='\t')
+
+        def run_grid_search(parallel=None):
+            for k in range(K):
+                k0 = int(k*NN / K)
+                k1 = int((k+1) * NN / K)
+                task_arguments = (
+                    (prob_grid[g], args.omega_hat, S, prepared, g)
+                    for g in range(k0, k1)
+                )
+                if parallel is None:
+                    grid_results = [
+                        _FDR_par(f_args) for f_args in task_arguments
+                    ]
+                else:
+                    grid_results = parallel(
+                        joblib.delayed(_FDR_par)(f_args)
+                        for f_args in task_arguments
+                    )
+                logging.info('Grid search: {} percent finished. Time: \t{:.3f} min'.format((k+1)*100./K, (time.time()-start_fdr)/ 60.))
+                for fdr_values, grid_index in grid_results:
+                    FDR[grid_index, :] = fdr_values
+
+                np.savetxt(args.out + '_fdr_mat.txt', FDR, delimiter='\t')
+
+        if args.cores == 1:
+            run_grid_search()
+        else:
+            with joblib.Parallel(
+                n_jobs=args.cores,
+                backend='multiprocessing',
+                verbose=0,
+                batch_size='auto',
+            ) as parallel:
+                run_grid_search(parallel)
 
     if not np.all(np.isfinite(FDR)):
         raise ValueError('maxFDR grid search returned non-finite values')
@@ -1715,6 +1785,8 @@ fdr_opts.add_argument('--cores', default=1, action='store', type=int, help='Numb
 fdr_opts.add_argument('--p_sig', default=5.0e-8, type=float, action='store', help='P-value threshold used for statistical signifiance. Default is p=5.0e-8 (genome-wide significance).' )
 fdr_opts.add_argument('--n_approx', default=True, dest='n_approx', action='store_true', help='Speed up FDR calculation by replacing the sample size of a SNP for each trait by the mean across SNPs (for each trait). Recommended and enabled by default.')
 fdr_opts.add_argument('--no_n_approx', '--no-n-approx', dest='n_approx', action='store_false', help='Use each distinct row of SNP sample sizes in the maxFDR power calculation instead of trait means.')
+fdr_opts.add_argument('--fdr_backend', '--fdr-backend', choices=('python', 'numba'), default='python', help='maxFDR execution engine. The optional numba backend fuses automatic-grid generation and evaluation; install requirements-numba.txt first. Default is python.')
+fdr_opts.add_argument('--fdr_chunk_size', '--fdr-chunk-size', default=100000, type=int, help='Number of automatic maxFDR candidates evaluated per native chunk with --fdr_backend numba. Default is 100000.')
 
 # fdr_opts.add_argument('--binned_n', default=False, action='store_true', help='When --n_approx is off, this options allows for a sped-up version of the max_FDR calculation by weighting the power calculations of unique rows.')
 

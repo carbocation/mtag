@@ -1,4 +1,7 @@
 *~
 .nfs*
 *.pyc
+*.nbc
+*.nbi
+__pycache__/
 *.log
