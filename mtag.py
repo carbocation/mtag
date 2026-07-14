@@ -1340,7 +1340,15 @@ def _run_numba_fdr_grid(args, causal_states, prepared, pi_causal_ss):
     )
     logging.info(
         'Fused Numba maxFDR engine will generate and evaluate {:,} candidate '
-        'grid points using {} threads.'.format(total_points, thread_count)
+        'grid points using {} threads, {}.'.format(
+            total_points,
+            thread_count,
+            (
+                'retaining the full feasible grid'
+                if getattr(args, 'fdr_write_full_grid', False)
+                else 'retaining only each trait\'s maximum'
+            ),
+        )
     )
     start_fdr = time.time()
     next_progress = [10]
@@ -1355,7 +1363,12 @@ def _run_numba_fdr_grid(args, causal_states, prepared, pi_causal_ss):
             )
             next_progress[0] += 10
 
-    return mtag_numba.evaluate_automatic_grid(
+    evaluation_function = (
+        mtag_numba.evaluate_automatic_grid
+        if getattr(args, 'fdr_write_full_grid', False)
+        else mtag_numba.evaluate_automatic_grid_max
+    )
+    return evaluation_function(
         args.intervals,
         causal_states,
         args.omega_hat,
@@ -1364,6 +1377,42 @@ def _run_numba_fdr_grid(args, causal_states, prepared, pi_causal_ss):
         chunk_size=getattr(args, 'fdr_chunk_size', 100000),
         progress_callback=report_progress,
     )
+
+
+def _validated_fdr_values(fdr_values):
+    """Validate and clip maxFDR values within numerical tolerance."""
+    fdr_values = np.asarray(fdr_values, dtype=float)
+    if not np.all(np.isfinite(fdr_values)):
+        raise ValueError('maxFDR grid search returned non-finite values')
+    numerical_tolerance = 1.0e-12
+    if (
+        np.any(fdr_values < -numerical_tolerance)
+        or np.any(fdr_values > 1.0 + numerical_tolerance)
+    ):
+        raise ValueError('maxFDR grid search returned a value outside [0, 1]')
+    return np.clip(fdr_values, 0.0, 1.0)
+
+
+def _save_and_log_max_fdr(args, max_fdr, maximizing_probabilities):
+    """Save the compact result and log its maximizing point per trait."""
+    max_fdr_path = args.out + '_max_fdr.txt'
+    np.savetxt(max_fdr_path, max_fdr[None, :], delimiter='\t')
+    logging.info('Saved maximum FDR estimates in {}'.format(max_fdr_path))
+    logging.info(borderline)
+    if args.fit_ss:
+        logging.info('FDR with the Spike-Slab parameters')
+        message = 'FDR of Trait {}: {} at probs = {}'
+    else:
+        logging.info('Maximum FDR')
+        message = 'Max FDR of Trait {}: {} at probs = {}'
+    for trait, value in enumerate(max_fdr):
+        logging.info(
+            message.format(
+                trait + 1, value, maximizing_probabilities[trait]
+            )
+        )
+    logging.info(borderline)
+    logging.info('Completed FDR calculations.')
 
 
 def fdr(args, Ns_f, Zs):
@@ -1437,18 +1486,40 @@ def fdr(args, Ns_f, Zs):
                 '--fdr_backend numba currently supports the automatic grid '
                 'only; omit --grid_file or use --fdr_backend python'
             )
-        prob_grid, FDR = _run_numba_fdr_grid(
+        numba_result = _run_numba_fdr_grid(
             args, S, prepared, pi_causal_ss
         )
-        if len(prob_grid) == 0:
-            raise ValueError(
-                'No feasible maxFDR grid points remain after applying '
-                'causal-state and covariance constraints'
+        if getattr(args, 'fdr_write_full_grid', False):
+            prob_grid, FDR = numba_result
+            feasible_count = len(prob_grid)
+            if feasible_count == 0:
+                raise ValueError(
+                    'No feasible maxFDR grid points remain after applying '
+                    'causal-state and covariance constraints'
+                )
+            logging.info(
+                'Number of gridpoints searched: {}'.format(feasible_count)
             )
-        if pi_causal_ss is not None:
-            logging.info('{} probabilities remain after restricting to the grid points with causal probabilities less than one unit (i.e. 1/intervals) from the Spike-Slab fitted causal probabilities.'.format(len(prob_grid)))
-        logging.info('Number of gridpoints searched: {}'.format(len(prob_grid)))
-        np.savetxt(args.out + '_prob_grid.txt', prob_grid, delimiter='\t')
+            np.savetxt(
+                args.out + '_prob_grid.txt', prob_grid, delimiter='\t'
+            )
+        else:
+            max_FDR, maximizing_probabilities, feasible_count = numba_result
+            if feasible_count == 0:
+                raise ValueError(
+                    'No feasible maxFDR grid points remain after applying '
+                    'causal-state and covariance constraints'
+                )
+            if pi_causal_ss is not None:
+                logging.info('{} probabilities remain after restricting to the grid points with causal probabilities less than one unit (i.e. 1/intervals) from the Spike-Slab fitted causal probabilities.'.format(feasible_count))
+            logging.info(
+                'Number of gridpoints searched: {}'.format(feasible_count)
+            )
+            max_FDR = _validated_fdr_values(max_FDR)
+            _save_and_log_max_fdr(
+                args, max_FDR, maximizing_probabilities
+            )
+            return max_FDR, maximizing_probabilities
     else:
         if args.grid_file is not None:
             candidate_grid = load_probability_grid(args.grid_file, len(S))
@@ -1522,12 +1593,7 @@ def fdr(args, Ns_f, Zs):
             ) as parallel:
                 run_grid_search(parallel)
 
-    if not np.all(np.isfinite(FDR)):
-        raise ValueError('maxFDR grid search returned non-finite values')
-    numerical_tolerance = 1.0e-12
-    if np.any(FDR < -numerical_tolerance) or np.any(FDR > 1.0 + numerical_tolerance):
-        raise ValueError('maxFDR grid search returned a value outside [0, 1]')
-    FDR = np.clip(FDR, 0.0, 1.0)
+    FDR = _validated_fdr_values(FDR)
 
     # save FDR file once more
     np.savetxt(args.out+'_fdr_mat.txt', FDR, delimiter='\t')
@@ -1537,18 +1603,8 @@ def fdr(args, Ns_f, Zs):
     ind_max = np.argmax(FDR, axis=0)
     logging.info('grid point indices for max FDR for each trait: {}'.format(ind_max))
     max_FDR = np.max(FDR, axis=0)
-
-    if args.fit_ss:
-        logging.info('FDR with the Spike-Slab parameters')
-        for t in range(T):
-            logging.info('FDR of Trait {}: {} at probs = {}'.format(t+1, max_FDR[t], prob_grid[ind_max[t]]))
-    else:
-        logging.info('Maximum FDR')
-        for t in range(T):
-            logging.info('Max FDR of Trait {}: {} at probs = {}'.format(t+1, max_FDR[t], prob_grid[ind_max[t]]))
-
-    logging.info(borderline)
-    logging.info('Completed FDR calculations.')
+    maximizing_probabilities = prob_grid[ind_max]
+    _save_and_log_max_fdr(args, max_FDR, maximizing_probabilities)
     return FDR, prob_grid
 
 def mtag(args):
@@ -1787,6 +1843,7 @@ fdr_opts.add_argument('--n_approx', default=True, dest='n_approx', action='store
 fdr_opts.add_argument('--no_n_approx', '--no-n-approx', dest='n_approx', action='store_false', help='Use each distinct row of SNP sample sizes in the maxFDR power calculation instead of trait means.')
 fdr_opts.add_argument('--fdr_backend', '--fdr-backend', choices=('python', 'numba'), default='python', help='maxFDR execution engine. The optional numba backend fuses automatic-grid generation and evaluation; install requirements-numba.txt first. Default is python.')
 fdr_opts.add_argument('--fdr_chunk_size', '--fdr-chunk-size', default=100000, type=int, help='Number of automatic maxFDR candidates evaluated per native chunk with --fdr_backend numba. Default is 100000.')
+fdr_opts.add_argument('--fdr_write_full_grid', '--fdr-write-full-grid', action='store_true', help='With --fdr_backend numba, retain and write the complete feasible probability grid and FDR matrix instead of only the per-trait maxima.')
 
 # fdr_opts.add_argument('--binned_n', default=False, action='store_true', help='When --n_approx is off, this options allows for a sped-up version of the max_FDR calculation by weighting the power calculations of unique rows.')
 

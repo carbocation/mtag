@@ -57,6 +57,7 @@ def main():
     parser.add_argument("--seed", type=int, default=8128)
     parser.add_argument("--p-threshold", type=float, default=5.0e-8)
     parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument("--chunk-size", type=int, default=100_000)
     args = parser.parse_args()
     numba.set_num_threads(args.threads)
 
@@ -84,25 +85,39 @@ def main():
     python_seconds = time.perf_counter() - start
 
     start = time.perf_counter()
-    actual_grid, actual_fdr = mtag_numba.evaluate_automatic_grid_chunk(
-        0, total_points, args.intervals, states, omega, prepared
+    actual_max, actual_probabilities, feasible_count = (
+        mtag_numba.evaluate_automatic_grid_max(
+            args.intervals,
+            states,
+            omega,
+            prepared,
+            chunk_size=args.chunk_size,
+        )
     )
     numba_seconds = time.perf_counter() - start
 
-    np.testing.assert_array_equal(actual_grid, expected_grid)
+    expected_indices = np.argmax(expected_fdr, axis=0)
+    expected_max = expected_fdr[
+        expected_indices, np.arange(args.traits)
+    ]
+    expected_probabilities = expected_grid[expected_indices]
+    assert feasible_count == len(expected_grid)
+    np.testing.assert_array_equal(
+        actual_probabilities, expected_probabilities
+    )
     np.testing.assert_allclose(
-        actual_fdr, expected_fdr, rtol=1.0e-10, atol=1.0e-15
+        actual_max, expected_max, rtol=1.0e-10, atol=1.0e-15
     )
     print("Traits / intervals: {} / {}".format(args.traits, args.intervals))
     print("Candidate points:    {:,}".format(total_points))
-    print("Feasible points:     {:,}".format(len(actual_grid)))
+    print("Feasible points:     {:,}".format(feasible_count))
     print("Numba threads:       {}".format(args.threads))
     print("Python:              {:.6f} seconds".format(python_seconds))
     print("Numba:               {:.6f} seconds".format(numba_seconds))
     print("Speedup:             {:.2f}x".format(python_seconds / numba_seconds))
     print(
         "Maximum FDR error:   {:.3e}".format(
-            np.max(np.abs(actual_fdr - expected_fdr))
+            np.max(np.abs(actual_max - expected_max))
         )
     )
 

@@ -8,7 +8,12 @@ from numba import njit, prange
 
 def automatic_grid_size(num_states, intervals):
     """Return the number of lattice points in the automatic simplex grid."""
-    return math.comb(intervals + num_states - 1, num_states - 1)
+    total_points = math.comb(
+        intervals + num_states - 1, num_states - 1
+    )
+    if total_points > np.iinfo(np.int64).max:
+        raise OverflowError("automatic maxFDR grid exceeds int64 ranks")
+    return total_points
 
 
 def binomial_table(max_n, max_k):
@@ -19,9 +24,7 @@ def binomial_table(max_n, max_k):
         upper = min(n, max_k)
         for k in range(1, upper + 1):
             value = int(table[n - 1, k - 1]) + int(table[n - 1, k])
-            if value > np.iinfo(np.int64).max:
-                raise OverflowError("automatic maxFDR grid exceeds int64")
-            table[n, k] = value
+            table[n, k] = min(value, np.iinfo(np.int64).max)
     return table
 
 
@@ -276,3 +279,65 @@ def evaluate_automatic_grid(
             np.empty((0, causal_states.shape[1]), dtype=float),
         )
     return np.concatenate(probability_chunks), np.concatenate(fdr_chunks)
+
+
+def evaluate_automatic_grid_max(
+    intervals,
+    causal_states,
+    omega,
+    prepared,
+    pi_causal_ss=None,
+    chunk_size=100_000,
+    progress_callback=None,
+):
+    """Reduce an automatic grid to each trait's maximum in bounded memory."""
+    if chunk_size <= 0:
+        raise ValueError("Numba maxFDR chunk size must be positive")
+
+    num_states, num_traits = causal_states.shape
+    total_points = automatic_grid_size(num_states, intervals)
+    max_fdr = np.full(num_traits, -np.inf, dtype=float)
+    maximizing_probabilities = np.empty(
+        (num_traits, num_states), dtype=float
+    )
+    feasible_count = 0
+
+    for start_rank in range(0, total_points, chunk_size):
+        stop_rank = min(start_rank + chunk_size, total_points)
+        probability_chunk, fdr_chunk = evaluate_automatic_grid_chunk(
+            start_rank,
+            stop_rank,
+            intervals,
+            causal_states,
+            omega,
+            prepared,
+            pi_causal_ss=pi_causal_ss,
+        )
+        feasible_count += len(probability_chunk)
+        if len(probability_chunk):
+            if not np.all(np.isfinite(fdr_chunk)):
+                raise ValueError(
+                    "maxFDR grid search returned non-finite values"
+                )
+            numerical_tolerance = 1.0e-12
+            if (
+                np.any(fdr_chunk < -numerical_tolerance)
+                or np.any(fdr_chunk > 1.0 + numerical_tolerance)
+            ):
+                raise ValueError(
+                    "maxFDR grid search returned a value outside [0, 1]"
+                )
+            fdr_chunk = np.clip(fdr_chunk, 0.0, 1.0)
+            chunk_indices = np.argmax(fdr_chunk, axis=0)
+            trait_indices = np.arange(num_traits)
+            chunk_max = fdr_chunk[chunk_indices, trait_indices]
+            improved = chunk_max > max_fdr
+            max_fdr[improved] = chunk_max[improved]
+            for trait in np.flatnonzero(improved):
+                maximizing_probabilities[trait] = probability_chunk[
+                    chunk_indices[trait]
+                ]
+        if progress_callback is not None:
+            progress_callback(stop_rank, total_points)
+
+    return max_fdr, maximizing_probabilities, feasible_count

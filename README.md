@@ -39,7 +39,8 @@ python mtag.py --sumstats trait1.txt,trait2.txt --out results/mtag \
   --fdr --intervals 10
 ```
 
-The calculation writes `results/mtag_fdr_mat.txt` and
+The calculation writes the maximum estimates to `results/mtag_max_fdr.txt`.
+The default Python engine also writes `results/mtag_fdr_mat.txt` and
 `results/mtag_prob_grid.txt`. To rerun maxFDR from an existing set of MTAG
 outputs, use the same output prefix with `--skip_mtag`:
 
@@ -60,13 +61,14 @@ python mtag.py --sumstats trait1.txt,trait2.txt --out results/mtag \
   --fdr --intervals 10 --fdr-backend numba --cores 8
 ```
 
-The Numba engine generates and evaluates the automatic grid in chunks while
-preserving grid order and maxFDR calculations; its first invocation includes a
-one-time compilation cost. `--fdr-chunk-size` controls the candidate working set
-(default 100,000). Feasible rows are still retained and written to the
-probability-grid and FDR output files for feature parity, so this setting does
-not bound the size of those final results. Custom `--grid_file` inputs currently
-require `--fdr-backend python`.
+The Numba engine generates and evaluates the automatic grid in native-code
+chunks while preserving grid order and maxFDR calculations; its first
+invocation includes a one-time compilation cost. By default it retains only
+each trait's maximum and the probability vector where that maximum first
+occurs, so memory use remains bounded by `--fdr-chunk-size` (default 100,000).
+Add `--fdr-write-full-grid` if the complete legacy probability-grid and FDR
+matrix outputs are required. Custom `--grid_file` inputs currently require
+`--fdr-backend python`.
 
 A tutorial that walks through an example use of `mtag` may be found in the wiki.
 
