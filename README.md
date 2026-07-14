@@ -29,6 +29,29 @@ To test that the tool has been successfully installed, type:
 
 You should see a list of command-line flags and a description of the program. If an error is thrown instead, then there was some problem with the installation process.
 
+### maxFDR
+
+Run the maxFDR calculation together with MTAG by adding `--fdr`. The grid
+resolution is controlled by `--intervals`:
+
+```bash
+python mtag.py --sumstats trait1.txt,trait2.txt --out results/mtag \
+  --fdr --intervals 10
+```
+
+The calculation writes `results/mtag_fdr_mat.txt` and
+`results/mtag_prob_grid.txt`. To rerun maxFDR from an existing set of MTAG
+outputs, use the same output prefix with `--skip_mtag`:
+
+```bash
+python mtag.py --skip_mtag --out results/mtag --intervals 10
+```
+
+`--grid_file` accepts a whitespace-delimited custom probability grid,
+`--fit_ss` restricts the grid using fitted spike-slab causal probabilities,
+and `--no-n-approx` uses distinct SNP sample-size rows instead of the default
+trait-wise mean approximation.
+
 A tutorial that walks through an example use of `mtag` may be found in the wiki.
 
 ### Updating `mtag`

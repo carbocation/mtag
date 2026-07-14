@@ -102,6 +102,9 @@ def test_python3_cli_end_to_end_with_supplied_covariances(tmp_path):
             "0",
             "--maf_min",
             "0",
+            "--fdr",
+            "--intervals",
+            "2",
         ],
         cwd=ROOT,
         capture_output=True,
@@ -137,6 +140,28 @@ def test_python3_cli_end_to_end_with_supplied_covariances(tmp_path):
 
     assert (tmp_path / "results_omega_hat.txt").exists()
     assert (tmp_path / "results_sigma_hat.txt").exists()
+    probability_grid = np.loadtxt(tmp_path / "results_prob_grid.txt")
+    fdr_matrix = np.loadtxt(tmp_path / "results_fdr_mat.txt")
+    np.testing.assert_allclose(
+        probability_grid,
+        [
+            [0.0, 0.0, 0.0, 1.0],
+            [0.0, 0.0, 0.5, 0.5],
+            [0.0, 0.5, 0.0, 0.5],
+            [0.5, 0.0, 0.0, 0.5],
+        ],
+    )
+    np.testing.assert_allclose(
+        fdr_matrix,
+        [
+            [0.0, 0.0],
+            [0.0, 5.232765790830277e-08],
+            [5.227828076989659e-08, 0.0],
+            [5.224847071238093e-08, 5.229583678208338e-08],
+        ],
+        rtol=1.0e-10,
+        atol=1.0e-15,
+    )
     assert (tmp_path / "results.log").exists()
 
 

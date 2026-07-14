@@ -7,6 +7,7 @@ from __future__ import absolute_import
 import numpy as np
 import pandas as pd
 import scipy.optimize
+import scipy.special
 import argparse
 import itertools
 import time
@@ -1024,9 +1025,12 @@ def simplex_walk(num_dims, samples_per_dim):
                for x, y in zip([-1] + c, c + [max_])])
 
 def scale_omega(gen_corr_mat, priors, S=None):
-    assert gen_corr_mat.shape[0] == gen_corr_mat.shape[1]
+    gen_corr_mat = np.asarray(gen_corr_mat, dtype=float)
+    priors = np.asarray(priors, dtype=float)
+    if gen_corr_mat.ndim != 2 or gen_corr_mat.shape[0] != gen_corr_mat.shape[1]:
+        raise ValueError('genetic covariance matrix must be square')
     T = gen_corr_mat.shape[1]
-    omega = np.zeros_like(gen_corr_mat)
+    omega = np.zeros_like(gen_corr_mat, dtype=float)
     if S is None:
         S = create_S(T)
     n_S = len(S)
@@ -1038,6 +1042,42 @@ def scale_omega(gen_corr_mat, priors, S=None):
             omega[p1,p2] = gen_corr_mat[p1,p2] / np.sum(priors[caus_state])
 
     return omega
+
+
+def load_probability_grid(file_path, n_states, sum_tolerance=1.0e-8):
+    """Load and validate a user-supplied maxFDR probability grid."""
+    prob_grid = np.atleast_2d(np.asarray(np.loadtxt(file_path), dtype=float))
+    if prob_grid.shape[1] != n_states:
+        raise ValueError(
+            'maxFDR grid file must contain {} columns (one for each causal '
+            'state); found {}'.format(n_states, prob_grid.shape[1])
+        )
+
+    valid_rows = (
+        np.all(np.isfinite(prob_grid), axis=1)
+        & np.all(prob_grid >= 0.0, axis=1)
+        & np.all(prob_grid <= 1.0, axis=1)
+        & np.isclose(
+            np.sum(prob_grid, axis=1),
+            1.0,
+            rtol=0.0,
+            atol=sum_tolerance,
+        )
+    )
+    excluded = int(np.sum(~valid_rows))
+    if excluded:
+        logging.info(
+            'Excluded {} maxFDR grid rows with invalid probabilities.'.format(
+                excluded
+            )
+        )
+    prob_grid = prob_grid[valid_rows]
+    if len(prob_grid) == 0:
+        raise ValueError(
+            'maxFDR grid file contains no valid probability rows; each row '
+            'must contain finite values in [0, 1] that sum to 1'
+        )
+    return prob_grid
 
 def compute_fdr(prob, t, omega, sigma, S, Ns,N_counts, p_threshold):
 
@@ -1063,17 +1103,25 @@ def compute_fdr(prob, t, omega, sigma, S, Ns,N_counts, p_threshold):
 
         power_state_t[k] = Prob_signif_cond_t[k] * float(prob[k])
 
-    FDR_val = np.sum(power_state_t[~S[:,t]]) / np.sum(power_state_t)
+    total_power = np.sum(power_state_t)
+    if not np.isfinite(total_power) or total_power <= 0.0:
+        raise ValueError(
+            'maxFDR could not calculate positive finite discovery power for '
+            'the supplied grid point'
+        )
+    FDR_val = np.sum(power_state_t[~S[:,t]]) / total_power
 
     return FDR_val
 
 def is_pos_semidef(m):
-    if m.shape[0] == 2 and m.shape[1] == 2:
-        return np.sqrt(m[0, 0]*m[1,1]) >= np.abs(m[0, 1])
-    else:
-        eigs =  np.linalg.eigvals(m)
-
-    return np.all(eigs >= 0)
+    m = np.asarray(m, dtype=float)
+    if m.ndim != 2 or m.shape[0] != m.shape[1]:
+        return False
+    if not np.all(np.isfinite(m)) or not np.allclose(m, m.T):
+        return False
+    eigs = np.linalg.eigvalsh(m)
+    tolerance = np.finfo(float).eps * max(1.0, np.max(np.abs(eigs))) * len(m)
+    return np.all(eigs >= -tolerance)
 
 def neglogL_single_SS(x, beta, se, transformed=True):
     '''
@@ -1090,15 +1138,22 @@ def neglogL_single_SS(x, beta, se, transformed=True):
 
     '''
     if  transformed:
-        prob_null = 1.0 / (1.0 + np.exp(-1 * x[0]))
+        prob_null = scipy.special.expit(x[0])
         tau = np.exp(-x[1])
     else:
         prob_null, tau = x
 
-    causal_pdf = scipy.stats.norm.pdf(beta, loc=0,scale=np.sqrt(tau**2 + se**2))
-    noncausal_pdf = scipy.stats.norm.pdf(beta,loc=0, scale = se)
-
-    return -1. * np.sum(np.log( (1.0-prob_null)*causal_pdf + prob_null * noncausal_pdf))
+    causal_logpdf = scipy.stats.norm.logpdf(
+        beta, loc=0, scale=np.sqrt(tau**2 + se**2)
+    )
+    noncausal_logpdf = scipy.stats.norm.logpdf(beta, loc=0, scale=se)
+    component_logpdfs = np.vstack(
+        (
+            np.log1p(-prob_null) + causal_logpdf,
+            np.log(prob_null) + noncausal_logpdf,
+        )
+    )
+    return -1.0 * np.sum(scipy.special.logsumexp(component_logpdfs, axis=0))
 
 def cback_print(x):
     logging.info(x)
@@ -1106,13 +1161,19 @@ def cback_print(x):
 def _optim_ss(f_args):
     beta_t, se_t, starting_params, solver_opts = f_args
     start_pi, start_tau = starting_params
-    x_0 = ( 1.0/(1.0 + np.exp(-start_pi)), -np.log(start_tau) )
+    if not 0.0 < start_pi < 1.0:
+        raise ValueError('spike-slab starting pi must be strictly between 0 and 1')
+    if start_tau <= 0.0:
+        raise ValueError('spike-slab starting tau must be positive')
+    x_0 = (np.log(start_pi / (1.0 - start_pi)), -np.log(start_tau))
     # beta_t, se_t = f_args
     optim_results = scipy.optimize.minimize(neglogL_single_SS, x_0, args=(beta_t, se_t,True), method='Nelder-Mead', options=solver_opts, callback=None)
 
     t_pi, t_tau = optim_results.x
-    pi_null =  1.0 / (1.0 + np.exp(-1 * t_pi))
+    pi_null = scipy.special.expit(t_pi)
     tau = np.exp(-t_tau)
+    if not np.isfinite(pi_null) or not np.isfinite(tau):
+        raise ValueError('spike-slab optimization returned non-finite parameters')
     return pi_null, tau
 
 def ss_estimation(args, betas, se, max_iter=1000, tol=1.0e-10,
@@ -1145,10 +1206,15 @@ def ss_estimation(args, betas, se, max_iter=1000, tol=1.0e-10,
     solver_opts['disp'] = True
     callback = cback_print if callback else None
     arg_list_ss = [(betas[:,t], se[:,t], starting_params, solver_opts) for t in range(T)]
-    ss_results =  joblib.Parallel(n_jobs = args.cores,
-                                          backend='multiprocessing',
-                                          verbose=0,
-                                          batch_size=1)(joblib.delayed(_optim_ss)(f_args) for f_args in arg_list_ss)
+    if args.cores == 1:
+        ss_results = [_optim_ss(f_args) for f_args in arg_list_ss]
+    else:
+        ss_results = joblib.Parallel(
+            n_jobs=args.cores,
+            backend='multiprocessing',
+            verbose=0,
+            batch_size=1,
+        )(joblib.delayed(_optim_ss)(f_args) for f_args in arg_list_ss)
     return ss_results
 
 def some_causal_for_allT(probs, S):
@@ -1180,29 +1246,54 @@ def fdr(args, Ns_f, Zs):
     '''
     logging.info('Beginning maxFDR calculations. Depending on the number of grid points specified, this might take some time...')
 
-    if not args.grid_file:
-        if args.intervals <= 0:
-            raise ValueError('spacing of grid points for the max FDR calculation must be a positive integer')
+    if args.intervals <= 0:
+        raise ValueError('spacing of grid points for the max FDR calculation must be a positive integer')
+    if args.cores <= 0:
+        raise ValueError('number of cores for the max FDR calculation must be positive')
+    if not 0.0 < args.p_sig < 1.0:
+        raise ValueError('maxFDR significance threshold must be strictly between 0 and 1')
 
-    Ns = np.round(Ns_f) # round to avoid decimals
+    Ns = np.asarray(np.round(Ns_f), dtype=float) # round to avoid decimals
+    if Ns.ndim != 2:
+        raise ValueError('maxFDR sample sizes must be a two-dimensional matrix')
     M,T = Ns.shape
+    if M == 0 or T == 0 or not np.all(np.isfinite(Ns)) or np.any(Ns <= 0.0):
+        raise ValueError('maxFDR sample sizes must be a non-empty matrix of positive finite values')
+    args.omega_hat = np.asarray(args.omega_hat, dtype=float)
+    args.sigma_hat = np.asarray(args.sigma_hat, dtype=float)
+    if args.omega_hat.shape != (T, T):
+        raise ValueError('maxFDR genetic covariance matrix dimensions do not match the number of traits')
+    if args.sigma_hat.shape != (T, T):
+        raise ValueError('maxFDR residual covariance matrix dimensions do not match the number of traits')
+    if not np.all(np.isfinite(args.omega_hat)) or not np.all(np.isfinite(args.sigma_hat)):
+        raise ValueError('maxFDR covariance matrices must contain only finite values')
+    if not np.allclose(args.omega_hat, args.omega_hat.T):
+        raise ValueError('maxFDR genetic covariance matrix must be symmetric')
+    if not np.allclose(args.sigma_hat, args.sigma_hat.T):
+        raise ValueError('maxFDR residual covariance matrix must be symmetric')
     logging.info('T='+str(T))
     S = create_S(T)
     causal_prob = lambda x, SS: np.sum(np.einsum('s,st->st',x,SS),axis=0)
 
     if args.grid_file is not None:
-        prob_grid = np.loadtxt(args.grid_file)
-        # exclude rows that don't sum to 1
-        prob_grid = prob_grid[(np.sum(prob_grid, axis=1) > 1.) & np.sum(prob_grid, axis=1) < 0]
+        prob_grid = load_probability_grid(args.grid_file, len(S))
     else:
         # automate the creation of the probability grid
         # one_dim_interval = np.linspace(0., 1., args.intervals +1)
-        prob_grid = simplex_walk(len(S)-1, args.intervals+1)
+        prob_grid = np.asarray(
+            list(simplex_walk(len(S)-1, args.intervals+1)), dtype=float
+        )
     # exclude probabilities that have at least one trait with zero pi_causal
     # exclude probabilities that don't yield a valid NPD matrix
     prob_grid = [x for x in prob_grid if some_causal_for_allT(x,S) and is_pos_semidef(scale_omega(args.omega_hat, x,S))]
 
     if args.fit_ss:
+        Zs = np.asarray(Zs, dtype=float)
+        if Zs.shape != Ns.shape or not np.all(np.isfinite(Zs)):
+            raise ValueError(
+                'maxFDR Z scores must be a finite matrix matching the sample '
+                'size matrix when --fit_ss is used'
+            )
         gwas_se = 1. / np.sqrt(Ns)
         gwas_betas = gwas_se * Zs
 
@@ -1216,9 +1307,16 @@ def fdr(args, Ns_f, Zs):
         prob_grid = [p for p in prob_grid if np.all(np.abs(causal_prob(p,S)-pi_causal_ss) < (1. / args.intervals) ) ]
         logging.info('{} probabilities remain after restricting to the grid points with causal probabilities less than one unit (i.e. 1/intervals) from the Spike-Slab fitted causal probabilities.'.format(len(prob_grid)))
 
+    if len(prob_grid) == 0:
+        raise ValueError(
+            'No feasible maxFDR grid points remain after applying causal-state '
+            'and covariance constraints'
+        )
+    prob_grid = np.asarray(prob_grid, dtype=float)
+
     logging.info('Number of gridpoints to search: {}'.format(len(prob_grid)))
 
-    FDR = -1.23 * np.ones((len(prob_grid), T))
+    FDR = np.full((len(prob_grid), T), np.nan)
 
     # performing coarse grid search
     logging.info('Performing grid search using {} cores.'.format(args.cores))
@@ -1243,23 +1341,44 @@ def fdr(args, Ns_f, Zs):
 
     arg_list = [(probs, args.omega_hat, args.sigma_hat, S, N_vals,N_weights, args.p_sig, g, t) for t in range(T) for g, probs in enumerate(prob_grid)]
     NN = len(arg_list)
-    K = 10
+    K = min(10, NN)
     start_fdr =time.time()
-    for k in range(K):
-        k0 = int(k*NN / K)
-        k1 = int((k+1) * NN / K)
-        sublist = arg_list[k0:k1] if k + 1 != K else arg_list[k0:]
-        grid_results =  joblib.Parallel(n_jobs = args.cores,
-                                          backend='multiprocessing',
-                                          verbose=0,
-                                          batch_size='auto')(joblib.delayed(_FDR_par)(f_args) for f_args in sublist)
-        logging.info('Grid search: {} percent finished for . Time: \t{:.3f} min'.format((k+1)*100./K, (time.time()-start_fdr)/ 60.))
-        for i in range(len(grid_results)):
-            FDR_gt, coord = grid_results[i] # coord = (g,t)
-            FDR[coord[0], coord[1]] = FDR_gt
 
-        np.savetxt(args.out + '_fdr_mat.txt', FDR, delimiter='\t')
-        np.savetxt(args.out + '_prob_grid.txt', prob_grid, delimiter='\t')
+    def run_grid_search(parallel=None):
+        for k in range(K):
+            k0 = int(k*NN / K)
+            k1 = int((k+1) * NN / K)
+            sublist = arg_list[k0:k1] if k + 1 != K else arg_list[k0:]
+            if parallel is None:
+                grid_results = [_FDR_par(f_args) for f_args in sublist]
+            else:
+                grid_results = parallel(
+                    joblib.delayed(_FDR_par)(f_args) for f_args in sublist
+                )
+            logging.info('Grid search: {} percent finished. Time: \t{:.3f} min'.format((k+1)*100./K, (time.time()-start_fdr)/ 60.))
+            for FDR_gt, coord in grid_results:
+                FDR[coord[0], coord[1]] = FDR_gt
+
+            np.savetxt(args.out + '_fdr_mat.txt', FDR, delimiter='\t')
+            np.savetxt(args.out + '_prob_grid.txt', prob_grid, delimiter='\t')
+
+    if args.cores == 1:
+        run_grid_search()
+    else:
+        with joblib.Parallel(
+            n_jobs=args.cores,
+            backend='multiprocessing',
+            verbose=0,
+            batch_size='auto',
+        ) as parallel:
+            run_grid_search(parallel)
+
+    if not np.all(np.isfinite(FDR)):
+        raise ValueError('maxFDR grid search returned non-finite values')
+    numerical_tolerance = 1.0e-12
+    if np.any(FDR < -numerical_tolerance) or np.any(FDR > 1.0 + numerical_tolerance):
+        raise ValueError('maxFDR grid search returned a value outside [0, 1]')
+    FDR = np.clip(FDR, 0.0, 1.0)
 
     # save FDR file once more
     np.savetxt(args.out+'_fdr_mat.txt', FDR, delimiter='\t')
@@ -1281,6 +1400,7 @@ def fdr(args, Ns_f, Zs):
 
     logging.info(borderline)
     logging.info('Completed FDR calculations.')
+    return FDR, prob_grid
 
 def mtag(args):
 
@@ -1514,7 +1634,8 @@ fdr_opts.add_argument('--fit_ss', default=False, action='store_true', help='This
 fdr_opts.add_argument('--intervals', default=10, action='store',type=int, help='Number of intervals that you would like to partition the [0,1] interval. For example example, with two traits and --intervals set 10, then maxFDR will calculated over the set of feasible points in {0., 0.1, 0.2,..,0.9,1.0}^2.')
 fdr_opts.add_argument('--cores', default=1, action='store', type=int, help='Number of threads/cores use to compute the FDR grid points for each trait.')
 fdr_opts.add_argument('--p_sig', default=5.0e-8, type=float, action='store', help='P-value threshold used for statistical signifiance. Default is p=5.0e-8 (genome-wide significance).' )
-fdr_opts.add_argument('--n_approx', default=True, action='store_true', help='Speed up FDR calculation by replacing the sample size of a SNP for each trait by the mean across SNPs (for each trait). Recommended.')
+fdr_opts.add_argument('--n_approx', default=True, dest='n_approx', action='store_true', help='Speed up FDR calculation by replacing the sample size of a SNP for each trait by the mean across SNPs (for each trait). Recommended and enabled by default.')
+fdr_opts.add_argument('--no_n_approx', '--no-n-approx', dest='n_approx', action='store_false', help='Use each distinct row of SNP sample sizes in the maxFDR power calculation instead of trait means.')
 
 # fdr_opts.add_argument('--binned_n', default=False, action='store_true', help='When --n_approx is off, this options allows for a sped-up version of the max_FDR calculation by weighting the power calculations of unique rows.')
 
@@ -1549,8 +1670,16 @@ if __name__ == '__main__':
 
         # parse output options
         (out_dir, out_file) = os.path.split(args.out)
-        ofile_list = [x for x in os.listdir(out_dir) if out_file+'_trait' in x]
+        out_dir = out_dir or '.'
+        trait_pattern = re.compile(
+            r'^{}_trait_(\d+)\.txt$'.format(re.escape(out_file))
+        )
+        ofile_list = [x for x in os.listdir(out_dir) if trait_pattern.match(x)]
         T = len(ofile_list)
+        if T == 0:
+            raise ValueError(
+                'No MTAG trait output files found for --out {}'.format(args.out)
+            )
         df_d = dict()
 
         # extract Ns and Zs
